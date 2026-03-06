@@ -421,6 +421,14 @@ async fn run_prompt(
     use_color: bool,
     thinking_api_key: Option<&str>,
 ) -> Usage {
+    // Spawn the Haiku label call and agent prompt concurrently.
+    // The agent loop runs on a background task, so events buffer in the channel
+    // while we wait for the thinking label.
+    let label_fut = thinking_api_key.map(|key| {
+        let key = key.to_owned();
+        let msg = prompt.to_owned();
+        tokio::spawn(async move { fetch_thinking_label(&key, &msg).await })
+    });
     let mut rx = agent.prompt(prompt).await;
     let mut last_usage = Usage::default();
     let mut tool_starts: HashMap<String, Instant> = HashMap::new();
@@ -434,33 +442,19 @@ async fn run_prompt(
         color(RESET, use_color),
     );
 
-    // Show a static fallback immediately so it never looks frozen.
-    let mut current_label = thinking_label().to_owned();
+    // Await the Haiku label; fall back to a random static label on failure.
+    let current_label = match label_fut {
+        Some(handle) => handle
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| thinking_label().to_owned()),
+        None => thinking_label().to_owned(),
+    };
     print_status_line(&current_label, yellow, dim, reset);
-
-    // Optionally spawn a Haiku call to get a contextual label.
-    let label_handle = thinking_api_key.map(|key| {
-        let key = key.to_owned();
-        let msg = prompt.to_owned();
-        tokio::spawn(async move { fetch_thinking_label(&key, &msg).await })
-    });
-    let mut label_fut = label_handle.map(Box::pin);
 
     loop {
         tokio::select! {
-            // If the contextual label arrives, update the status line.
-            result = async { label_fut.as_mut().unwrap().as_mut().await },
-                if label_fut.is_some() =>
-            {
-                label_fut = None;
-                if let Ok(Some(label)) = result {
-                    current_label = label;
-                    if !streaming_text {
-                        clear_status_line();
-                        print_status_line(&current_label, yellow, dim, reset);
-                    }
-                }
-            }
             event = rx.recv() => {
                 let Some(event) = event else { break };
 
@@ -571,23 +565,38 @@ async fn run_prompt(
 /// Maximum number of characters to include from memory content in the system prompt.
 const MEMORY_MAX_CHARS: usize = 4000;
 
-/// Builds the effective system prompt by optionally appending memory content.
+/// Builds the effective system prompt by highlighting project constraints and appending memory content.
 ///
-/// If `memory_content` is empty, returns `base` unchanged. Otherwise, appends
-/// a `## Persistent Memory` section. Content exceeding [`MEMORY_MAX_CHARS`] is
-/// truncated with a `[truncated]` suffix.
+/// When project context contains mandatory rules (like TDD), they are emphasized
+/// at the top of the prompt to make them harder to ignore. Memory content is
+/// appended as a separate section if present.
 ///
 /// # Arguments
 ///
-/// * `base` - The base system prompt (project context + core prompt).
+/// * `base` - The base system prompt (includes project context + core prompt).
 /// * `memory_content` - Raw content from `MEMORY.md`, possibly empty.
 ///
 /// # Returns
 ///
-/// The assembled system prompt string.
+/// The assembled system prompt string with emphasized project constraints.
 fn build_effective_system_prompt(base: &str, memory_content: &str) -> String {
+    // Look for project context that contains mandatory constraints
+    let enhanced_base = if base.contains("<project-context>") && base.contains("MANDATORY") {
+        // Extract and emphasize mandatory project constraints
+        let emphasized = base.replace(
+            "<project-context>",
+            "⚠️  MANDATORY PROJECT CONSTRAINTS ⚠️\n\nThe following rules MUST be followed without exception:\n\n<project-context>"
+        );
+        emphasized.replace(
+            "</project-context>",
+            "</project-context>\n\n⚠️  END MANDATORY CONSTRAINTS ⚠️\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+    } else {
+        base.to_owned()
+    };
+
     if memory_content.is_empty() {
-        return base.to_owned();
+        return enhanced_base;
     }
 
     let truncated = if memory_content.len() > MEMORY_MAX_CHARS {
@@ -603,7 +612,7 @@ fn build_effective_system_prompt(base: &str, memory_content: &str) -> String {
         memory_content.to_owned()
     };
 
-    format!("{base}\n\n## Persistent Memory\n{truncated}")
+    format!("{enhanced_base}\n\n## Persistent Memory\n{truncated}")
 }
 
 /// Formats a human-readable summary of a tool invocation.
@@ -1535,8 +1544,23 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_effective_system_prompt tests
+    // system prompt structure tests (TDD for improved project context emphasis)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn system_prompt_emphasizes_project_constraints_when_present() {
+        // RED: Test that when project context contains MANDATORY rules,
+        // they are highlighted prominently in the final system prompt.
+        let base_with_project_context = "<project-context>\n# Source: /test/CLAUDE.md\n### Red/Green TDD (MANDATORY)\n**Every change follows strict TDD.**\n</project-context>\n\nYou are a helpful assistant.";
+        
+        let result = build_effective_system_prompt(base_with_project_context, "");
+        
+        // The test should pass now because our enhanced function emphasizes mandatory rules
+        assert!(
+            result.contains("⚠️  MANDATORY PROJECT CONSTRAINTS"),
+            "System prompt should clearly highlight mandatory project constraints, got: {result}"
+        );
+    }
 
     #[test]
     fn build_effective_system_prompt_empty_memory_returns_base() {
