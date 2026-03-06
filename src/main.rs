@@ -42,11 +42,12 @@ When the user asks you to do something, do it -- don't just explain how.
 Use tools proactively: read files to understand context, run commands to verify your work.
 After making changes, run tests or verify the result when appropriate.
 
-You have persistent memory that survives across sessions. Use it:
+You have persistent memory that survives across sessions. Your long-term memory
+(MEMORY.md) is already included in this prompt above. Use your memory tools to:
 - Save user preferences, project conventions, and key decisions to long-term memory.
 - When the user corrects you or states a preference, save it so you don't repeat the mistake.
 - Use daily notes to record what you accomplished during a session.
-- Check your memory before starting complex tasks -- you may have relevant context from earlier.
+- Read daily notes from previous days when you need context on recent work.
 - Keep long-term memory concise: update or remove stale entries rather than appending indefinitely."#;
 
 /// Beezle — AI coding agent CLI.
