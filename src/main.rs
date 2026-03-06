@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use beezle::config::{self, AppConfig, is_config_complete, load_config, run_onboarding};
+use beezle::context;
 use yoagent::agent::Agent;
 use yoagent::provider::{AnthropicProvider, ModelConfig, OpenAiCompatProvider};
 use yoagent::skills::SkillSet;
@@ -143,11 +144,18 @@ fn resolve_model(config: &AppConfig, cli_override: Option<&str>) -> String {
 /// * `model` - The model identifier to use.
 /// * `api_key` - The resolved API key.
 /// * `skills` - Loaded skill set.
+/// * `system_prompt` - The full system prompt (base + project context).
 ///
 /// # Returns
 ///
 /// A configured `Agent` ready for prompting.
-fn build_agent(config: &AppConfig, model: &str, api_key: &str, skills: SkillSet) -> Agent {
+fn build_agent(
+    config: &AppConfig,
+    model: &str,
+    api_key: &str,
+    skills: SkillSet,
+    system_prompt: &str,
+) -> Agent {
     let mut agent = if let Some(ref ollama) = config.providers.ollama {
         Agent::new(OpenAiCompatProvider)
             .with_model_config(ModelConfig::local(&ollama.base_url, model))
@@ -156,7 +164,7 @@ fn build_agent(config: &AppConfig, model: &str, api_key: &str, skills: SkillSet)
     };
 
     agent = agent
-        .with_system_prompt(SYSTEM_PROMPT)
+        .with_system_prompt(system_prompt)
         .with_model(model)
         .with_api_key(api_key)
         .with_skills(skills)
@@ -375,7 +383,22 @@ async fn main() -> anyhow::Result<()> {
     let api_key = resolve_api_key(&app_config);
     let skills = load_skills(&cli.skills);
 
-    let mut agent = build_agent(&app_config, &model, &api_key, skills.clone());
+    // Assemble system prompt: project context (if any) + base prompt.
+    let cwd = std::env::current_dir()?;
+    let project_context = context::load_project_context(&cwd, context::DEFAULT_MAX_CHARS);
+    let system_prompt = if project_context.is_empty() {
+        SYSTEM_PROMPT.to_owned()
+    } else {
+        format!("{project_context}\n{SYSTEM_PROMPT}")
+    };
+
+    let mut agent = build_agent(
+        &app_config,
+        &model,
+        &api_key,
+        skills.clone(),
+        &system_prompt,
+    );
 
     // Single-shot mode: run one prompt and exit.
     if let Some(ref prompt_text) = cli.prompt {
@@ -437,7 +460,13 @@ async fn main() -> anyhow::Result<()> {
             }
             s if s.starts_with("/model ") => {
                 let new_model = s.trim_start_matches("/model ").trim();
-                agent = build_agent(&app_config, new_model, &api_key, skills.clone());
+                agent = build_agent(
+                    &app_config,
+                    new_model,
+                    &api_key,
+                    skills.clone(),
+                    &system_prompt,
+                );
                 println!("{dim}  (switched to {new_model}, conversation cleared){reset}\n");
                 continue;
             }
