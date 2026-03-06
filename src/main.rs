@@ -344,139 +344,7 @@ fn print_status_line(label: &str, yellow: &str, dim: &str, reset: &str) {
     io::stdout().flush().ok();
 }
 
-/// Generates shimmer animation frames for a given text.
-///
-/// Creates multiple frames where a shimmer effect moves across the text,
-/// creating a wave-like animation using ANSI brightness and color codes.
-///
-/// # Arguments
-///
-/// * `text` - The base text to shimmer over.
-/// * `count` - Number of animation frames to generate.
-///
-/// # Returns
-///
-/// A vector of strings, each representing one animation frame with ANSI codes.
-fn generate_shimmer_frames(text: &str, count: usize) -> Vec<String> {
-    if count == 0 {
-        return vec![];
-    }
-    
-    let mut frames = Vec::with_capacity(count);
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-    
-    for i in 0..count {
-        let mut frame = String::new();
-        
-        for (char_idx, &ch) in chars.iter().enumerate() {
-            // Create a shimmer wave that moves based on frame number
-            let wave_center = (i * len) / count;
-            let distance = (char_idx as isize - wave_center as isize).abs() as usize;
-            
-            // Apply different brightness based on distance from wave center
-            match distance {
-                0 => {
-                    // Wave peak - bright white + bold
-                    frame.push_str(&format!("\x1b[1m\x1b[37m{ch}\x1b[0m"));
-                }
-                1 => {
-                    // Near peak - bright
-                    frame.push_str(&format!("\x1b[37m{ch}\x1b[0m"));
-                }
-                2 => {
-                    // Medium - normal dim color
-                    frame.push_str(&format!("\x1b[2m{ch}\x1b[0m"));
-                }
-                _ => {
-                    // Far from peak - very dim
-                    frame.push_str(&format!("\x1b[2m\x1b[90m{ch}\x1b[0m"));
-                }
-            }
-        }
-        
-        frames.push(frame);
-    }
-    
-    frames
-}
-
-/// Animates the status line with a shimmer effect.
-///
-/// Continuously cycles through shimmer animation frames until cancelled.
-/// Clears the line and updates it with each frame to create smooth animation.
-///
-/// # Arguments
-///
-/// * `label` - The text to animate.
-/// * `frame_duration` - Time between animation frames.
-/// * `cancel_rx` - Receiver to stop the animation.
-///
-/// # Returns
-///
-/// A `JoinHandle` that completes when the animation is cancelled.
-async fn animate_status_line(
-    label: &str,
-    frame_duration: std::time::Duration,
-    mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
-) -> tokio::task::JoinHandle<()> {
-    let label = label.to_owned();
-    tokio::spawn(async move {
-        let frames = generate_shimmer_frames(&label, 8); // 8 frames for smooth animation
-        let mut frame_idx = 0;
-        
-        loop {
-            tokio::select! {
-                _ = &mut cancel_rx => {
-                    // Clear the status line when cancelled
-                    clear_status_line();
-                    break;
-                }
-                _ = tokio::time::sleep(frame_duration) => {
-                    // Print next frame
-                    let current_frame = &frames[frame_idx % frames.len()];
-                    print!("\r\x1b[33m*\x1b[0m \x1b[2m{current_frame}...\x1b[0m");
-                    io::stdout().flush().ok();
-                    
-                    frame_idx += 1;
-                }
-            }
-        }
-    })
-}
-
-/// Strips ANSI escape codes from a string for testing purposes.
-///
-/// # Arguments
-///
-/// * `text` - String that may contain ANSI escape codes.
-///
-/// # Returns
-///
-/// The string with all ANSI escape codes removed.
-fn strip_ansi_codes(text: &str) -> String {
-    // Simple regex-free approach: remove everything between \x1b[ and 'm'
-    let mut result = String::new();
-    let mut chars = text.chars();
-    
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            // Found escape sequence, skip until 'm'
-            if chars.next() == Some('[') {
-                for next_ch in chars.by_ref() {
-                    if next_ch == 'm' {
-                        break;
-                    }
-                }
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-    
-    result
-}
-
+/// Clears the current status/thinking line by overwriting with spaces.
 fn clear_status_line() {
     print!("\r\x1b[2K");
     io::stdout().flush().ok();
@@ -583,30 +451,7 @@ async fn run_prompt(
             .unwrap_or_else(|| thinking_label().to_owned()),
         None => thinking_label().to_owned(),
     };
-    
-    // Start animated thinking indicator
-    let (animation_stop_tx, mut animation_stop_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let animation_label = current_label.clone();
-    let animation_handle = tokio::spawn(async move {
-        let frames = generate_shimmer_frames(&animation_label, 8);
-        let mut frame_idx = 0;
-        let frame_duration = std::time::Duration::from_millis(200);
-        
-        loop {
-            tokio::select! {
-                _ = animation_stop_rx.recv() => {
-                    clear_status_line();
-                    break;
-                }
-                _ = tokio::time::sleep(frame_duration) => {
-                    let current_frame = &frames[frame_idx % frames.len()];
-                    print!("\r\x1b[33m*\x1b[0m \x1b[2m{current_frame}...\x1b[0m");
-                    io::stdout().flush().ok();
-                    frame_idx += 1;
-                }
-            }
-        }
-    });
+    print_status_line(&current_label, yellow, dim, reset);
 
     loop {
         tokio::select! {
@@ -615,9 +460,7 @@ async fn run_prompt(
 
                 match event {
                     AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args, .. } => {
-                        // Stop animation for tool output
-                        let _ = animation_stop_tx.send(()).await;
-                        
+                        clear_status_line();
                         if streaming_text {
                             println!();
                             streaming_text = false;
@@ -639,13 +482,11 @@ async fn run_prompt(
                         } else {
                             println!(" {green}ok{duration}{reset}");
                         }
-                        // Show static status line after tool completion
                         print_status_line(&current_label, yellow, dim, reset);
                     }
                     AgentEvent::MessageUpdate { delta: StreamDelta::Text { delta }, .. } => {
                         // During text streaming, hide the status line.
                         if !streaming_text {
-                            let _ = animation_stop_tx.send(()).await;
                             clear_status_line();
                             streaming_text = true;
                         }
@@ -654,7 +495,6 @@ async fn run_prompt(
                     }
                     AgentEvent::MessageUpdate { delta: StreamDelta::Thinking { delta }, .. } => {
                         if !streaming_text {
-                            let _ = animation_stop_tx.send(()).await;
                             clear_status_line();
                             streaming_text = true;
                         }
@@ -664,7 +504,6 @@ async fn run_prompt(
                     AgentEvent::MessageEnd { message: AgentMessage::Llm(Message::Assistant {
                         stop_reason: StopReason::Error, error_message, ..
                     }) } => {
-                        let _ = animation_stop_tx.send(()).await;
                         clear_status_line();
                         if streaming_text {
                             println!();
@@ -681,7 +520,6 @@ async fn run_prompt(
                             println!();
                             streaming_text = false;
                         }
-                        let _ = animation_stop_tx.send(()).await;
                         clear_status_line();
                         print_status_line(&current_label, yellow, dim, reset);
                     }
@@ -694,13 +532,11 @@ async fn run_prompt(
                         }
                     }
                     AgentEvent::ProgressMessage { text, .. } => {
-                        let _ = animation_stop_tx.send(()).await;
                         clear_status_line();
                         println!("{dim}  {text}{reset}");
                         print_status_line(&current_label, yellow, dim, reset);
                     }
                     AgentEvent::InputRejected { reason } => {
-                        let _ = animation_stop_tx.send(()).await;
                         clear_status_line();
                         println!("{red}  rejected: {reason}{reset}");
                         print_status_line(&current_label, yellow, dim, reset);
@@ -715,9 +551,7 @@ async fn run_prompt(
         }
     }
 
-    // Stop animation and clean up
-    let _ = animation_stop_tx.send(()).await;
-    let _ = animation_handle.await;
+    // Clean up the persistent status line.
     clear_status_line();
     if streaming_text {
         println!();
@@ -1133,11 +967,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     println!("{dim}  bye{reset}\n");
-
-    // The terminal channel's `spawn_blocking` call is blocked on stdin and
-    // cannot be cancelled by tokio's runtime shutdown. Force-exit the process
-    // now that all cleanup (session save, goodbye message) is complete.
-    std::process::exit(0);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1847,46 +1677,5 @@ mod tests {
 
         // Should process tool execution events and return without panicking.
         let _usage = run_prompt(&mut agent, "run a command", false, None).await;
-    }
-
-    // -----------------------------------------------------------------------
-    // Animated thinking indicator tests (TDD RED step)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_animated_thinking_shimmer_generates_frames() {
-        // RED: Test that we can generate shimmer animation frames
-        let frames = generate_shimmer_frames("Thinking", 3);
-        assert_eq!(frames.len(), 3);
-        
-        // Each frame should show different positions of the shimmer effect
-        assert_ne!(frames[0], frames[1]);
-        assert_ne!(frames[1], frames[2]);
-        
-        // All frames should contain the base text characters (ignoring ANSI codes)
-        for frame in &frames {
-            // Remove ANSI codes to check for base text
-            let clean_frame = strip_ansi_codes(frame);
-            assert_eq!(clean_frame, "Thinking");
-        }
-        
-        // Frames should contain ANSI color codes for shimmer effect
-        for frame in &frames {
-            assert!(frame.contains("\x1b["), "Frame should contain ANSI codes: {}", frame);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_animate_status_line_cycles_frames() {
-        use std::time::Duration;
-        // RED: Test that status line animation cycles through frames
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-        let handle = animate_status_line("Processing", Duration::from_millis(100), cancel_rx);
-        
-        tokio::time::sleep(Duration::from_millis(350)).await;
-        let _ = cancel_tx.send(());
-        
-        // Should complete without panicking when cancelled
-        let _ = handle.await;
     }
 }
