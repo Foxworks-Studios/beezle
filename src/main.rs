@@ -168,12 +168,17 @@ fn resolve_model(config: &AppConfig, cli_override: Option<&str>) -> String {
 /// # Returns
 ///
 /// A configured `Agent` ready for prompting.
+///
+/// Registers an `on_after_turn` callback that prints a progress line after
+/// each LLM turn, giving real-time feedback while `agent.prompt()` runs
+/// the full agent loop internally.
 fn build_agent(
     config: &AppConfig,
     model: &str,
     api_key: &str,
     skills: SkillSet,
     system_prompt: &str,
+    use_color: bool,
 ) -> Agent {
     let is_ollama = config.agent.default_provider == "ollama";
     let mut agent = if is_ollama {
@@ -193,9 +198,47 @@ fn build_agent(
         .with_model(model)
         .with_api_key(api_key)
         .with_skills(skills)
-        .with_tools(default_tools());
+        .with_tools(default_tools())
+        .on_after_turn(move |messages, _usage| {
+            // Print a per-turn progress line showing the latest action.
+            let dim = color(DIM, use_color);
+            let reset = color(RESET, use_color);
+
+            // Find the most recent tool result or assistant message to summarize.
+            if let Some(summary) = summarize_latest_turn(messages) {
+                // Clear any previous thinking line, print progress.
+                print!("\r                                        \r");
+                print!("{dim}  {summary}{reset}");
+                io::stdout().flush().ok();
+            }
+        });
 
     agent
+}
+
+/// Summarizes the latest turn for the progress indicator.
+///
+/// Looks at the most recent messages to find tool calls or assistant text
+/// and produces a short description like "ran: ls -la" or "thinking (turn 3)".
+fn summarize_latest_turn(messages: &[AgentMessage]) -> Option<String> {
+    // Count turns (assistant messages) for the turn number.
+    let turn_count = messages
+        .iter()
+        .filter(|m| matches!(m, AgentMessage::Llm(Message::Assistant { .. })))
+        .count();
+
+    // Look for the most recent tool result to summarize.
+    for msg in messages.iter().rev() {
+        if let AgentMessage::Llm(Message::ToolResult { tool_name, .. }) = msg {
+            return Some(format!("ran: {tool_name} (turn {turn_count})"));
+        }
+        // Stop looking once we hit the assistant message for this turn.
+        if matches!(msg, AgentMessage::Llm(Message::Assistant { .. })) {
+            break;
+        }
+    }
+
+    Some(format!("thinking (turn {turn_count})"))
 }
 
 /// Truncates a string to `max` characters, preserving char boundaries.
@@ -578,6 +621,7 @@ async fn main() -> anyhow::Result<()> {
         &api_key,
         skills.clone(),
         &system_prompt,
+        use_color,
     );
 
     // Resume a previous session if requested.
@@ -720,6 +764,7 @@ async fn main() -> anyhow::Result<()> {
                         &api_key,
                         skills.clone(),
                         &system_prompt,
+                        use_color,
                     );
                     println!("{dim}  (switched to {model}, conversation cleared){reset}\n");
                 }
