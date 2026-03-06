@@ -351,6 +351,21 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let use_color = !cli.no_color;
 
+    // Initialize structured logging.
+    // --verbose overrides to debug; otherwise BEEZLE_LOG env var or default warn.
+    let log_filter = if cli.verbose {
+        "debug".to_owned()
+    } else {
+        std::env::var("BEEZLE_LOG").unwrap_or_else(|_| "warn".into())
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_new(&log_filter)
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_ansi(use_color)
+        .init();
+
     // Ensure ~/.beezle/ directory structure exists.
     config::ensure_dirs()?;
 
@@ -360,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
         None => config::default_config_path()?,
     };
     let mut app_config = load_config(Some(&config_path))?;
+    tracing::debug!(config = %config_path.display(), "loaded configuration");
 
     // If config is incomplete, run interactive onboarding.
     if !is_config_complete(&app_config) {
@@ -382,10 +398,15 @@ async fn main() -> anyhow::Result<()> {
     let model = resolve_model(&app_config, cli.model.as_deref());
     let api_key = resolve_api_key(&app_config);
     let skills = load_skills(&cli.skills);
+    tracing::debug!(%model, skills_count = skills.len(), "resolved model and skills");
 
     // Assemble system prompt: project context (if any) + base prompt.
     let cwd = std::env::current_dir()?;
     let project_context = context::load_project_context(&cwd, context::DEFAULT_MAX_CHARS);
+    tracing::debug!(
+        context_len = project_context.len(),
+        "loaded project context"
+    );
     let system_prompt = if project_context.is_empty() {
         SYSTEM_PROMPT.to_owned()
     } else {
