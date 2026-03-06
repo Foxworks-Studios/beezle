@@ -415,7 +415,7 @@ async fn main() -> anyhow::Result<()> {
     let session_mgr = SessionManager::new(&beezle_home.join("sessions"))?;
     let mut session_key = SessionManager::generate_key();
 
-    let model = resolve_model(&app_config, cli.model.as_deref());
+    let mut model = resolve_model(&app_config, cli.model.as_deref());
     let api_key = resolve_api_key(&app_config);
     let skills = load_skills(&cli.skills);
     tracing::debug!(%model, skills_count = skills.len(), "resolved model and skills");
@@ -569,16 +569,21 @@ async fn main() -> anyhow::Result<()> {
                 }
                 continue;
             }
-            s if s.starts_with("/model ") => {
-                let new_model = s.trim_start_matches("/model ").trim();
-                agent = build_agent(
-                    &app_config,
-                    new_model,
-                    &api_key,
-                    skills.clone(),
-                    &system_prompt,
-                );
-                println!("{dim}  (switched to {new_model}, conversation cleared){reset}\n");
+            s if s.starts_with("/model") => {
+                let arg = s.trim_start_matches("/model").trim();
+                if arg.is_empty() {
+                    println!("{dim}  (model: {model}){reset}\n");
+                } else {
+                    model = arg.to_owned();
+                    agent = build_agent(
+                        &app_config,
+                        &model,
+                        &api_key,
+                        skills.clone(),
+                        &system_prompt,
+                    );
+                    println!("{dim}  (switched to {model}, conversation cleared){reset}\n");
+                }
                 continue;
             }
             _ => {}
