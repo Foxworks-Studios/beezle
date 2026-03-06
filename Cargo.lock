@@ -2382,8 +2382,7 @@ checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
 [[package]]
 name = "yoagent"
 version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ebab2e48668ccb02cd6cbcaa75cfa3d67632cc1f0fe4cee3be557b26b271063"
+source = "git+https://github.com/Foxworks-Studios/yoagent.git?branch=streaming-prompt#a78ca220b8034f9b2a6990cbb3aa427e953a012e"
 dependencies = [
  "async-trait",
  "base64",
