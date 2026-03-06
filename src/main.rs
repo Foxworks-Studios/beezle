@@ -12,7 +12,10 @@ use beezle::config::{self, AppConfig, is_config_complete, load_config, run_onboa
 use beezle::context;
 use beezle::session::SessionManager;
 use yoagent::agent::Agent;
-use yoagent::provider::{AnthropicProvider, ModelConfig, OpenAiCompatProvider};
+use yoagent::provider::{
+    AnthropicProvider, ModelConfig, OpenAiCompatProvider, ProviderError, StreamConfig, StreamEvent,
+    StreamProvider,
+};
 use yoagent::skills::SkillSet;
 use yoagent::tools::default_tools;
 use yoagent::*;
@@ -167,6 +170,64 @@ fn resolve_model(config: &AppConfig, cli_override: Option<&str>) -> String {
 ///
 /// # Returns
 ///
+/// Wraps a `StreamProvider` to print LLM text deltas to stdout in real time.
+///
+/// Intercepts the `tx` channel passed to `stream()`, spawns a forwarding task
+/// that prints `TextDelta` events as they arrive, then passes them through to
+/// the original channel so the agent loop still processes them normally.
+struct StreamProviderWrapper {
+    inner: Box<dyn StreamProvider>,
+}
+
+#[async_trait::async_trait]
+impl StreamProvider for StreamProviderWrapper {
+    async fn stream(
+        &self,
+        config: StreamConfig,
+        tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Message, ProviderError> {
+        // Create an intercepting channel: provider sends to our tx,
+        // we forward to the original tx while printing text deltas.
+        let (intercept_tx, mut intercept_rx) =
+            tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+
+        let original_tx = tx;
+
+        // Spawn a forwarder that prints text deltas and passes everything through.
+        let forwarder = tokio::spawn(async move {
+            let mut in_text = false;
+            while let Some(event) = intercept_rx.recv().await {
+                if let StreamEvent::TextDelta { ref delta, .. } = event {
+                    if !in_text {
+                        // Clear thinking indicator on first text.
+                        clear_thinking_line();
+                        println!();
+                        in_text = true;
+                    }
+                    print!("{delta}");
+                    io::stdout().flush().ok();
+                }
+                // Forward all events to the original channel.
+                let _ = original_tx.send(event);
+            }
+            if in_text {
+                println!();
+            }
+            // Signal whether we printed text (so render_events can skip it).
+            in_text
+        });
+
+        // Run the real provider with our intercepting channel.
+        let result = self.inner.stream(config, intercept_tx, cancel).await;
+
+        // Wait for forwarder to finish draining.
+        let _ = forwarder.await;
+
+        result
+    }
+}
+
 /// Wraps an `AgentTool` to print real-time execution feedback to stdout.
 ///
 /// Since `agent.prompt()` awaits the full agent loop before returning events,
@@ -247,17 +308,28 @@ fn build_agent(
     use_color: bool,
 ) -> Agent {
     let is_ollama = config.agent.default_provider == "ollama";
-    let mut agent = if is_ollama {
+
+    let (provider, model_cfg): (Box<dyn StreamProvider>, Option<ModelConfig>) = if is_ollama {
         let base_url = config
             .providers
             .ollama
             .as_ref()
             .map(|o| o.base_url.as_str())
             .unwrap_or("http://localhost:11434");
-        Agent::new(OpenAiCompatProvider).with_model_config(ModelConfig::local(base_url, model))
+        (
+            Box::new(OpenAiCompatProvider),
+            Some(ModelConfig::local(base_url, model)),
+        )
     } else {
-        Agent::new(AnthropicProvider)
+        (Box::new(AnthropicProvider), None)
     };
+
+    let wrapped_provider = StreamProviderWrapper { inner: provider };
+
+    let mut agent = Agent::new(wrapped_provider);
+    if let Some(cfg) = model_cfg {
+        agent = agent.with_model_config(cfg);
+    }
 
     agent = agent
         .with_system_prompt(system_prompt)
@@ -434,24 +506,17 @@ async fn render_events(
     use_color: bool,
 ) -> Usage {
     let mut last_usage = Usage::default();
-    let mut in_text = false;
 
     while let Some(event) = rx.recv().await {
         match event {
-            // ToolExecutionStart/End are handled in real time by ToolWrapper
-            // during the agent loop — skip them here to avoid duplicates.
-            AgentEvent::ToolExecutionStart { .. } | AgentEvent::ToolExecutionEnd { .. } => {}
-            AgentEvent::MessageUpdate {
-                delta: StreamDelta::Text { delta },
+            // Tool and text streaming events are handled in real time by
+            // ToolWrapper and StreamProviderWrapper — skip to avoid duplicates.
+            AgentEvent::ToolExecutionStart { .. }
+            | AgentEvent::ToolExecutionEnd { .. }
+            | AgentEvent::MessageUpdate {
+                delta: StreamDelta::Text { .. },
                 ..
-            } => {
-                if !in_text {
-                    println!();
-                    in_text = true;
-                }
-                print!("{delta}");
-                io::stdout().flush().ok();
-            }
+            } => {}
             AgentEvent::MessageEnd {
                 message:
                     AgentMessage::Llm(Message::Assistant {
@@ -460,10 +525,6 @@ async fn render_events(
                         ..
                     }),
             } => {
-                if in_text {
-                    println!();
-                    in_text = false;
-                }
                 let (red, reset) = (color(RED, use_color), color(RESET, use_color));
                 let msg = error_message.as_deref().unwrap_or("unknown error");
                 tracing::error!("{msg}");
@@ -479,10 +540,6 @@ async fn render_events(
             }
             _ => {}
         }
-    }
-
-    if in_text {
-        println!();
     }
 
     last_usage
