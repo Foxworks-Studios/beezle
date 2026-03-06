@@ -97,7 +97,9 @@ fn print_usage(usage: &Usage, use_color: bool) {
     }
 }
 
-/// Resolves the API key from the config's environment variable reference.
+/// Resolves the API key from the config, respecting `default_provider`.
+///
+/// For Anthropic, prefers OAuth token over env var. For Ollama, returns empty.
 ///
 /// # Arguments
 ///
@@ -107,14 +109,20 @@ fn print_usage(usage: &Usage, use_color: bool) {
 ///
 /// The API key string, or an empty string if using a local provider.
 fn resolve_api_key(config: &AppConfig) -> String {
-    if let Some(ref anthropic) = config.providers.anthropic {
-        std::env::var(&anthropic.api_key_env).unwrap_or_default()
-    } else {
-        String::new()
+    match config.agent.default_provider.as_str() {
+        "ollama" => String::new(),
+        _ => config
+            .providers
+            .anthropic
+            .as_ref()
+            .map(|a| a.resolve_api_key())
+            .unwrap_or_default(),
     }
 }
 
 /// Determines the model name from config, with an optional CLI override.
+///
+/// Respects `default_provider` to pick the right provider's model.
 ///
 /// # Arguments
 ///
@@ -128,16 +136,26 @@ fn resolve_model(config: &AppConfig, cli_override: Option<&str>) -> String {
     if let Some(m) = cli_override {
         return m.to_owned();
     }
-    if let Some(ref anthropic) = config.providers.anthropic {
-        anthropic.model.clone()
-    } else if let Some(ref ollama) = config.providers.ollama {
-        ollama.model.clone()
-    } else {
-        "claude-sonnet-4-20250514".into()
+    match config.agent.default_provider.as_str() {
+        "ollama" => config
+            .providers
+            .ollama
+            .as_ref()
+            .map(|o| o.model.clone())
+            .unwrap_or_else(|| "qwen2.5:14b".into()),
+        _ => config
+            .providers
+            .anthropic
+            .as_ref()
+            .map(|a| a.model.clone())
+            .unwrap_or_else(|| "claude-sonnet-4-20250514".into()),
     }
 }
 
 /// Builds a yoagent `Agent` from the resolved configuration.
+///
+/// Uses `default_provider` to select `AnthropicProvider` or
+/// `OpenAiCompatProvider` (for Ollama).
 ///
 /// # Arguments
 ///
@@ -157,9 +175,15 @@ fn build_agent(
     skills: SkillSet,
     system_prompt: &str,
 ) -> Agent {
-    let mut agent = if let Some(ref ollama) = config.providers.ollama {
-        Agent::new(OpenAiCompatProvider)
-            .with_model_config(ModelConfig::local(&ollama.base_url, model))
+    let is_ollama = config.agent.default_provider == "ollama";
+    let mut agent = if is_ollama {
+        let base_url = config
+            .providers
+            .ollama
+            .as_ref()
+            .map(|o| o.base_url.as_str())
+            .unwrap_or("http://localhost:11434");
+        Agent::new(OpenAiCompatProvider).with_model_config(ModelConfig::local(base_url, model))
     } else {
         Agent::new(AnthropicProvider)
     };

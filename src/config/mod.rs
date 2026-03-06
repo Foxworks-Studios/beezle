@@ -24,19 +24,41 @@ pub struct AppConfig {
 }
 
 /// Agent identity and behavioral limits.
+///
+/// Uses `#[serde(default)]` on fields so that config files with extra
+/// fields from beezle-rs (compaction, subagent iterations, etc.) are
+/// tolerated without parse errors.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentConfig {
     /// Display name for the agent.
+    #[serde(default = "default_agent_name")]
     pub name: String,
     /// Maximum agent loop iterations per turn.
+    #[serde(default = "default_max_iterations")]
     pub max_iterations: usize,
+    /// Which provider to use by default ("anthropic" or "ollama").
+    #[serde(default = "default_provider_name")]
+    pub default_provider: String,
+}
+
+fn default_agent_name() -> String {
+    "beezle".into()
+}
+
+fn default_max_iterations() -> usize {
+    20
+}
+
+fn default_provider_name() -> String {
+    "anthropic".into()
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            name: "beezle".into(),
-            max_iterations: 20,
+            name: default_agent_name(),
+            max_iterations: default_max_iterations(),
+            default_provider: default_provider_name(),
         }
     }
 }
@@ -51,20 +73,74 @@ pub struct ProvidersConfig {
 }
 
 /// Anthropic API configuration.
+///
+/// Supports both API key auth (via env var) and OAuth token auth
+/// (imported from Claude CLI). Extra fields from beezle-rs configs
+/// (thinking, request_delay_ms, etc.) are silently ignored.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AnthropicConfig {
     /// Name of the environment variable holding the API key.
+    #[serde(default = "default_api_key_env")]
     pub api_key_env: String,
     /// Default model identifier.
+    #[serde(default = "default_anthropic_model")]
     pub model: String,
+    /// OAuth access token (from Claude CLI subscription).
+    #[serde(default)]
+    pub oauth_access_token: Option<String>,
+    /// OAuth refresh token (from Claude CLI subscription).
+    #[serde(default)]
+    pub oauth_refresh_token: Option<String>,
+}
+
+fn default_api_key_env() -> String {
+    "ANTHROPIC_API_KEY".into()
+}
+
+fn default_anthropic_model() -> String {
+    "claude-sonnet-4-20250514".into()
 }
 
 impl Default for AnthropicConfig {
     fn default() -> Self {
         Self {
-            api_key_env: "ANTHROPIC_API_KEY".into(),
-            model: "claude-sonnet-4-20250514".into(),
+            api_key_env: default_api_key_env(),
+            model: default_anthropic_model(),
+            oauth_access_token: None,
+            oauth_refresh_token: None,
         }
+    }
+}
+
+impl AnthropicConfig {
+    /// Returns `true` if this config has a usable authentication method:
+    /// either an API key env var that is set, or an OAuth access token.
+    pub fn has_auth(&self) -> bool {
+        // Check OAuth first (preferred).
+        if let Some(ref token) = self.oauth_access_token
+            && !token.is_empty()
+        {
+            return true;
+        }
+        // Fall back to API key env var.
+        !self.api_key_env.is_empty() && std::env::var(&self.api_key_env).is_ok()
+    }
+
+    /// Resolves the API key to use — prefers OAuth token, falls back to env var.
+    pub fn resolve_api_key(&self) -> String {
+        // OAuth access token takes priority.
+        if let Some(ref token) = self.oauth_access_token
+            && !token.is_empty()
+        {
+            return token.clone();
+        }
+        // Fall back to env var.
+        if !self.api_key_env.is_empty()
+            && let Ok(key) = std::env::var(&self.api_key_env)
+        {
+            return key;
+        }
+        String::new()
     }
 }
 
@@ -230,14 +306,17 @@ pub fn save_config(config: &AppConfig, path: &Path) -> Result<(), ConfigError> {
 ///
 /// * `config` - The configuration to check.
 pub fn is_config_complete(config: &AppConfig) -> bool {
-    // If Anthropic is configured, check that the env var is set
-    if let Some(ref anthropic) = config.providers.anthropic
-        && std::env::var(&anthropic.api_key_env).is_ok()
-    {
-        return true;
+    match config.agent.default_provider.as_str() {
+        "ollama" => config.providers.ollama.is_some(),
+        _ => {
+            // Anthropic (default): needs either OAuth token or API key env set.
+            config
+                .providers
+                .anthropic
+                .as_ref()
+                .is_some_and(|a| a.has_auth())
+        }
     }
-    // Ollama doesn't need an API key
-    config.providers.ollama.is_some()
 }
 
 #[cfg(test)]
@@ -317,8 +396,20 @@ mod tests {
     #[test]
     fn is_config_complete_returns_true_with_ollama() {
         let mut config = AppConfig::default();
+        config.agent.default_provider = "ollama".into();
         config.providers.anthropic = None;
         config.providers.ollama = Some(OllamaConfig::default());
+        assert!(is_config_complete(&config));
+    }
+
+    #[test]
+    fn is_config_complete_returns_true_with_oauth_token() {
+        let mut config = AppConfig::default();
+        config.providers.anthropic = Some(AnthropicConfig {
+            api_key_env: String::new(),
+            oauth_access_token: Some("sk-ant-oat01-test".into()),
+            ..AnthropicConfig::default()
+        });
         assert!(is_config_complete(&config));
     }
 

@@ -54,7 +54,11 @@ pub fn run_onboarding<R: BufRead, W: Write>(
             let api_key_env = prompt_api_key_env(input, output);
             let model = prompt_model(input, output, "claude-sonnet-4-20250514");
             config.providers = ProvidersConfig {
-                anthropic: Some(AnthropicConfig { api_key_env, model }),
+                anthropic: Some(AnthropicConfig {
+                    api_key_env,
+                    model,
+                    ..AnthropicConfig::default()
+                }),
                 ollama: None,
             };
         }
@@ -62,6 +66,7 @@ pub fn run_onboarding<R: BufRead, W: Write>(
             let base_url =
                 prompt_line(input, output, "  Ollama base URL", "http://localhost:11434");
             let model = prompt_model(input, output, "qwen2.5:14b");
+            config.agent.default_provider = "ollama".into();
             config.providers = ProvidersConfig {
                 anthropic: None,
                 ollama: Some(OllamaConfig { base_url, model }),
@@ -204,6 +209,7 @@ mod tests {
 
         let result = run_onboarding(config, &path, &mut input, &mut output).unwrap();
 
+        assert_eq!(result.agent.default_provider, "ollama");
         assert!(result.providers.anthropic.is_none());
         assert!(result.providers.ollama.is_some());
         let ollama = result.providers.ollama.unwrap();
