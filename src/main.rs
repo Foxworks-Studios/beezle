@@ -15,7 +15,9 @@ use beezle::channels::Channel;
 use beezle::channels::terminal::TerminalChannel;
 use beezle::config::{self, AppConfig, is_config_complete, load_config, run_onboarding};
 use beezle::context;
+use beezle::memory::{MemoryStore, SystemClock};
 use beezle::session::SessionManager;
+use beezle::tools::memory::{MemoryReadTool, MemoryWriteTool};
 use yoagent::agent::Agent;
 use yoagent::provider::{
     AnthropicProvider, ModelConfig, OpenAiCompatProvider, ProviderError, StreamConfig, StreamEvent,
@@ -423,6 +425,30 @@ impl AgentTool for SubAgentWrapper {
     }
 }
 
+/// Loads a [`MemoryStore`] rooted at `~/.beezle/memory/`.
+///
+/// Returns `None` if the home directory cannot be determined (logs a warning).
+/// The store is created without touching the filesystem -- directory creation
+/// happens lazily on first write.
+///
+/// # Returns
+///
+/// An `Arc<MemoryStore>` ready to be shared across tools, or `None` on failure.
+fn load_memory_store() -> Option<Arc<MemoryStore>> {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => {
+            tracing::warn!("could not determine home directory; memory system disabled");
+            return None;
+        }
+    };
+    let memory_dir = home.join(".beezle").join("memory");
+    Some(Arc::new(MemoryStore::new(
+        memory_dir,
+        Arc::new(SystemClock),
+    )))
+}
+
 /// A configured `Agent` ready for prompting.
 ///
 /// Tools are wrapped in `ToolWrapper` to print real-time execution feedback
@@ -434,6 +460,7 @@ fn build_agent(
     skills: SkillSet,
     system_prompt: &str,
     use_color: bool,
+    memory_store: Option<Arc<MemoryStore>>,
 ) -> Agent {
     let is_ollama = config.agent.default_provider == "ollama";
 
@@ -478,6 +505,18 @@ fn build_agent(
         inner: Box::new(subagent),
         use_color,
     }));
+
+    // Register memory tools when a MemoryStore is available.
+    if let Some(store) = memory_store {
+        tools.push(Box::new(ToolWrapper {
+            inner: Box::new(MemoryReadTool::new(Arc::clone(&store))),
+            use_color,
+        }));
+        tools.push(Box::new(ToolWrapper {
+            inner: Box::new(MemoryWriteTool::new(store)),
+            use_color,
+        }));
+    }
 
     agent = agent
         .with_system_prompt(system_prompt)
@@ -693,6 +732,44 @@ async fn render_events(
     last_usage
 }
 
+/// Maximum number of characters to include from memory content in the system prompt.
+const MEMORY_MAX_CHARS: usize = 4000;
+
+/// Builds the effective system prompt by optionally appending memory content.
+///
+/// If `memory_content` is empty, returns `base` unchanged. Otherwise, appends
+/// a `## Persistent Memory` section. Content exceeding [`MEMORY_MAX_CHARS`] is
+/// truncated with a `[truncated]` suffix.
+///
+/// # Arguments
+///
+/// * `base` - The base system prompt (project context + core prompt).
+/// * `memory_content` - Raw content from `MEMORY.md`, possibly empty.
+///
+/// # Returns
+///
+/// The assembled system prompt string.
+fn build_effective_system_prompt(base: &str, memory_content: &str) -> String {
+    if memory_content.is_empty() {
+        return base.to_owned();
+    }
+
+    let truncated = if memory_content.len() > MEMORY_MAX_CHARS {
+        // Truncate at a char boundary, then append marker.
+        let end = memory_content
+            .char_indices()
+            .take_while(|(i, _)| *i < MEMORY_MAX_CHARS)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(MEMORY_MAX_CHARS);
+        format!("{}[truncated]", &memory_content[..end])
+    } else {
+        memory_content.to_owned()
+    };
+
+    format!("{base}\n\n## Persistent Memory\n{truncated}")
+}
+
 /// Returns a random thinking-state verb for the status indicator.
 fn thinking_label() -> &'static str {
     const LABELS: &[&str] = &[
@@ -841,6 +918,7 @@ fn handle_slash_command(
                     skills.clone(),
                     system_prompt,
                     use_color,
+                    None,
                 );
                 format!("{dim}  (switched to {model}, conversation cleared){reset}\n")
             };
@@ -912,11 +990,25 @@ async fn main() -> anyhow::Result<()> {
         context_len = project_context.len(),
         "loaded project context"
     );
-    let system_prompt = if project_context.is_empty() {
+    let base_prompt = if project_context.is_empty() {
         SYSTEM_PROMPT.to_owned()
     } else {
         format!("{project_context}\n{SYSTEM_PROMPT}")
     };
+
+    // Load persistent memory and inject into the system prompt.
+    let memory_store = load_memory_store();
+    let memory_content = memory_store
+        .as_ref()
+        .and_then(|store| match store.read_long_term() {
+            Ok(content) => Some(content),
+            Err(e) => {
+                tracing::warn!("failed to read MEMORY.md: {e}");
+                None
+            }
+        })
+        .unwrap_or_default();
+    let system_prompt = build_effective_system_prompt(&base_prompt, &memory_content);
 
     let mut agent = build_agent(
         &app_config,
@@ -925,6 +1017,7 @@ async fn main() -> anyhow::Result<()> {
         skills.clone(),
         &system_prompt,
         use_color,
+        memory_store,
     );
 
     // Resume a previous session if requested.
@@ -1789,6 +1882,43 @@ mod tests {
             !collected.is_empty(),
             "on_update should have received at least one event"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_effective_system_prompt tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_effective_system_prompt_empty_memory_returns_base() {
+        let base = "You are a helpful assistant.";
+        let result = build_effective_system_prompt(base, "");
+        assert_eq!(result, base);
+    }
+
+    #[test]
+    fn build_effective_system_prompt_appends_memory_under_limit() {
+        let base = "You are a helpful assistant.";
+        let memory = "User prefers Rust.";
+        let result = build_effective_system_prompt(base, memory);
+        assert!(result.starts_with(base));
+        assert!(result.contains("\n\n## Persistent Memory\n"));
+        assert!(result.contains(memory));
+    }
+
+    #[test]
+    fn build_effective_system_prompt_truncates_over_4000_chars() {
+        let base = "You are a helpful assistant.";
+        let memory = "x".repeat(5000);
+        let result = build_effective_system_prompt(base, &memory);
+        assert!(result.contains("[truncated]"));
+        // The memory section (after the header) should not exceed 4000 chars
+        // plus the "[truncated]" suffix.
+        let header = "\n\n## Persistent Memory\n";
+        let memory_section = result.strip_prefix(base).unwrap();
+        assert!(memory_section.starts_with(header));
+        let content = memory_section.strip_prefix(header).unwrap();
+        // 4000 chars of memory + "[truncated]" = 4011
+        assert!(content.len() <= 4000 + "[truncated]".len());
     }
 
     #[tokio::test]

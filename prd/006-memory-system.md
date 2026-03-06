@@ -1,5 +1,7 @@
 # PRD 006: Persistent Memory System
 
+**Status:** TICKETS READY
+
 ## Summary
 
 Give the agent long-term and daily memory that persists across sessions,
