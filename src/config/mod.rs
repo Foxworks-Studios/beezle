@@ -1,6 +1,6 @@
 //! Configuration loading, validation, and persistence.
 //!
-//! Manages the `~/.beezle/config.toml` file and provides typed access
+//! Manages the `~/.beezle/agent.toml` file and provides typed access
 //! to all configuration sections. Creates default config and directory
 //! structure on first run.
 
@@ -221,13 +221,16 @@ pub fn beezle_home() -> Result<PathBuf, ConfigError> {
         .ok_or(ConfigError::NoHomeDir)
 }
 
-/// Returns the default config file path (`~/.beezle/config.toml`).
+/// Returns the default config file path (`~/.beezle/agent.toml`).
+///
+/// Uses `agent.toml` rather than `config.toml` to avoid overwriting the
+/// beezle-rs config that lives at `~/.beezle/config.toml`.
 ///
 /// # Errors
 ///
 /// Returns `ConfigError::NoHomeDir` if the home directory cannot be determined.
 pub fn default_config_path() -> Result<PathBuf, ConfigError> {
-    beezle_home().map(|h| h.join("config.toml"))
+    beezle_home().map(|h| h.join("agent.toml"))
 }
 
 /// Creates the `~/.beezle/` directory structure if it doesn't exist.
@@ -255,7 +258,7 @@ pub fn ensure_dirs() -> Result<PathBuf, ConfigError> {
 /// # Arguments
 ///
 /// * `path` - Optional explicit path to the config file. Falls back to
-///   `~/.beezle/config.toml` if `None`.
+///   `~/.beezle/agent.toml` if `None`.
 ///
 /// # Errors
 ///
