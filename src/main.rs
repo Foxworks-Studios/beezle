@@ -3,11 +3,14 @@
 //! Bootstraps configuration (with interactive onboarding on first run),
 //! parses CLI arguments, then starts the agent REPL loop.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
 
+use beezle::bus::{self, Response};
+use beezle::channels::Channel;
+use beezle::channels::terminal::TerminalChannel;
 use beezle::config::{self, AppConfig, is_config_complete, load_config, run_onboarding};
 use beezle::context;
 use beezle::session::SessionManager;
@@ -611,6 +614,97 @@ fn format_tool_summary(tool_name: &str, args: &serde_json::Value) -> String {
     }
 }
 
+/// Result of processing a potential slash command.
+enum SlashResult {
+    /// The command was `/quit` or `/exit`.
+    Quit,
+    /// A slash command was handled; contains the response message.
+    Handled(String),
+    /// Not a slash command — should be sent to the agent.
+    NotSlash,
+}
+
+/// Checks if `input` is a slash command and handles it if so.
+///
+/// Mutates agent/model/session state as needed for commands like `/clear`,
+/// `/model`, `/save`. Returns a `SlashResult` indicating what happened.
+#[allow(clippy::too_many_arguments)]
+fn handle_slash_command(
+    input: &str,
+    agent: &mut Agent,
+    model: &mut String,
+    session_key: &mut String,
+    app_config: &AppConfig,
+    api_key: &str,
+    skills: &SkillSet,
+    system_prompt: &str,
+    session_mgr: &SessionManager,
+    use_color: bool,
+    dim: &str,
+    reset: &str,
+) -> SlashResult {
+    match input {
+        "/quit" | "/exit" => SlashResult::Quit,
+        "/clear" => {
+            agent.clear_messages();
+            SlashResult::Handled(format!("{dim}  (conversation cleared){reset}\n"))
+        }
+        "/sessions" => {
+            let msg = match session_mgr.list() {
+                Ok(sessions) if sessions.is_empty() => {
+                    format!("{dim}  (no saved sessions){reset}\n")
+                }
+                Ok(sessions) => {
+                    let mut out = format!("{dim}  saved sessions:{reset}\n");
+                    for s in &sessions {
+                        let kb = s.size_bytes / 1024;
+                        out.push_str(&format!("{dim}    {:<30} ({kb} KB){reset}\n", s.key));
+                    }
+                    out
+                }
+                Err(e) => format!("{dim}  (error listing sessions: {e}){reset}\n"),
+            };
+            SlashResult::Handled(msg)
+        }
+        s if s.starts_with("/save") => {
+            let name = s.trim_start_matches("/save").trim();
+            let key = if name.is_empty() {
+                session_key.as_str()
+            } else {
+                *session_key = name.to_owned();
+                name
+            };
+            let msg = match agent.save_messages() {
+                Ok(json) => match session_mgr.save(key, &json) {
+                    Ok(_) => format!("{dim}  (saved as '{key}'){reset}\n"),
+                    Err(e) => format!("{dim}  (save error: {e}){reset}\n"),
+                },
+                Err(e) => format!("{dim}  (save error: {e}){reset}\n"),
+            };
+            SlashResult::Handled(msg)
+        }
+        s if s.starts_with("/model") => {
+            let arg = s.trim_start_matches("/model").trim();
+            let msg = if arg.is_empty() {
+                format!("{dim}  (model: {model}){reset}\n")
+            } else {
+                *model = arg.to_owned();
+                *agent = build_agent(
+                    app_config,
+                    model,
+                    api_key,
+                    skills.clone(),
+                    system_prompt,
+                    use_color,
+                );
+                format!("{dim}  (switched to {model}, conversation cleared){reset}\n")
+            };
+            SlashResult::Handled(msg)
+        }
+        _ => SlashResult::NotSlash,
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -748,98 +842,60 @@ async fn main() -> anyhow::Result<()> {
         std::env::current_dir()?.display()
     );
 
-    let stdin = io::stdin();
-    let mut lines = stdin.lock().lines();
+    // Create the command bus and spawn the terminal channel.
+    let (command_bus, mut bus_rx) = bus::command_bus(16);
+    let terminal_channel = TerminalChannel::new(use_color);
+    tokio::spawn(async move {
+        if let Err(e) = terminal_channel.run(command_bus).await {
+            tracing::error!("terminal channel error: {e}");
+        }
+    });
 
-    loop {
-        let (bold, green, reset) = (
-            color(BOLD, use_color),
-            color(GREEN, use_color),
-            color(RESET, use_color),
+    // Consume commands from the bus instead of reading stdin directly.
+    while let Some(cmd) = bus_rx.recv().await {
+        let input = cmd.content.trim().to_owned();
+        let (dim, reset) = (color(DIM, use_color), color(RESET, use_color));
+
+        // Handle slash commands on the consumer side.
+        // Compute a response message; None means it's a regular prompt.
+        let slash_response = handle_slash_command(
+            &input,
+            &mut agent,
+            &mut model,
+            &mut session_key,
+            &app_config,
+            &api_key,
+            &skills,
+            &system_prompt,
+            &session_mgr,
+            use_color,
+            dim,
+            reset,
         );
-        print!("{bold}{green}> {reset}");
-        io::stdout().flush().ok();
 
-        let line = match lines.next() {
-            Some(Ok(l)) => l,
-            _ => break,
-        };
+        match slash_response {
+            SlashResult::Quit => {
+                let _ = cmd.response_tx.send(Response {
+                    content: String::new(),
+                });
+                break;
+            }
+            SlashResult::Handled(msg) => {
+                let _ = cmd.response_tx.send(Response { content: msg });
+                continue;
+            }
+            SlashResult::NotSlash => {
+                // Regular prompt — send to agent, respond via oneshot.
+                let usage = run_single_prompt(&mut agent, &input, use_color, thinking_key).await;
+                print_usage(&usage, use_color);
+                println!();
 
-        let input = line.trim();
-        if input.is_empty() {
-            continue;
+                // Send empty response — output was already streamed to stdout.
+                let _ = cmd.response_tx.send(Response {
+                    content: String::new(),
+                });
+            }
         }
-
-        // Slash commands.
-        let dim = color(DIM, use_color);
-        match input {
-            "/quit" | "/exit" => break,
-            "/clear" => {
-                agent.clear_messages();
-                println!("{dim}  (conversation cleared){reset}\n");
-                continue;
-            }
-            "/sessions" => {
-                match session_mgr.list() {
-                    Ok(sessions) if sessions.is_empty() => {
-                        println!("{dim}  (no saved sessions){reset}\n");
-                    }
-                    Ok(sessions) => {
-                        println!("{dim}  saved sessions:{reset}");
-                        for s in &sessions {
-                            let kb = s.size_bytes / 1024;
-                            println!("{dim}    {:<30} ({kb} KB){reset}", s.key);
-                        }
-                        println!();
-                    }
-                    Err(e) => {
-                        println!("{dim}  (error listing sessions: {e}){reset}\n");
-                    }
-                }
-                continue;
-            }
-            s if s.starts_with("/save") => {
-                let name = s.trim_start_matches("/save").trim();
-                let key = if name.is_empty() {
-                    session_key.as_str()
-                } else {
-                    // Update session key to the user-chosen name.
-                    session_key = name.to_owned();
-                    name
-                };
-                match agent.save_messages() {
-                    Ok(json) => match session_mgr.save(key, &json) {
-                        Ok(_) => println!("{dim}  (saved as '{key}'){reset}\n"),
-                        Err(e) => println!("{dim}  (save error: {e}){reset}\n"),
-                    },
-                    Err(e) => println!("{dim}  (save error: {e}){reset}\n"),
-                }
-                continue;
-            }
-            s if s.starts_with("/model") => {
-                let arg = s.trim_start_matches("/model").trim();
-                if arg.is_empty() {
-                    println!("{dim}  (model: {model}){reset}\n");
-                } else {
-                    model = arg.to_owned();
-                    agent = build_agent(
-                        &app_config,
-                        &model,
-                        &api_key,
-                        skills.clone(),
-                        &system_prompt,
-                        use_color,
-                    );
-                    println!("{dim}  (switched to {model}, conversation cleared){reset}\n");
-                }
-                continue;
-            }
-            _ => {}
-        }
-
-        let usage = run_single_prompt(&mut agent, input, use_color, thinking_key).await;
-        print_usage(&usage, use_color);
-        println!();
     }
 
     // Auto-save session on exit.

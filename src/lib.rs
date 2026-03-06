@@ -3,6 +3,8 @@
 //! Built on the `yoagent` agent loop crate, with planned multi-channel
 //! input support (Discord, Slack, Telegram, WhatsApp).
 
+pub mod bus;
+pub mod channels;
 pub mod config;
 pub mod context;
 pub mod session;
