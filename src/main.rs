@@ -312,17 +312,19 @@ async fn run_single_prompt(
     use_color: bool,
     thinking_api_key: Option<&str>,
 ) -> Usage {
-    let mut rx = agent.prompt(prompt).await;
     let mut last_usage = Usage::default();
     let mut in_text = false;
     let mut thinking = true;
 
     let (dim, reset_code) = (color(DIM, use_color), color(RESET, use_color));
 
-    // Show a static fallback immediately so it never looks frozen.
+    // Show the thinking indicator BEFORE starting the prompt so the user
+    // sees feedback immediately, even while the HTTP connection is opening.
     let static_label = thinking_label();
     print!("{dim}  {static_label}...{reset_code}");
     io::stdout().flush().ok();
+
+    let mut rx = agent.prompt(prompt).await;
 
     // Optionally spawn a Haiku call to get a contextual label.
     let label_handle = thinking_api_key.map(|key| {
