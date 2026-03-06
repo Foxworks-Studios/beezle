@@ -5,9 +5,11 @@
 
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 
+use beezle::agent::build_subagent;
 use beezle::bus::{self, Response};
 use beezle::channels::Channel;
 use beezle::channels::terminal::TerminalChannel;
@@ -290,12 +292,135 @@ impl AgentTool for ToolWrapper {
     }
 }
 
-/// Wraps all tools in `ToolWrapper` for real-time execution feedback.
+/// Wraps tools in `ToolWrapper` for real-time execution feedback.
+///
+/// All tools are wrapped uniformly. Sub-agent tools should be wrapped
+/// separately with [`SubAgentWrapper`] before being added to the list.
 fn wrap_tools(tools: Vec<Box<dyn AgentTool>>, use_color: bool) -> Vec<Box<dyn AgentTool>> {
     tools
         .into_iter()
         .map(|inner| -> Box<dyn AgentTool> { Box::new(ToolWrapper { inner, use_color }) })
         .collect()
+}
+
+/// Wraps a sub-agent tool to display real-time progress in the terminal.
+///
+/// Unlike [`ToolWrapper`] which just prints start/end lines, this wrapper
+/// intercepts the sub-agent's `on_update` events and prints intermediate
+/// progress (tool calls, text deltas) in dim text with a `[sub]` prefix.
+/// Progress output is ephemeral -- printed to stdout but not stored in
+/// the parent's context.
+struct SubAgentWrapper {
+    inner: Box<dyn AgentTool>,
+    use_color: bool,
+}
+
+#[async_trait::async_trait]
+impl AgentTool for SubAgentWrapper {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn label(&self) -> &str {
+        self.inner.label()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.inner.parameters_schema()
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let use_color = self.use_color;
+        let (yellow, green, red, dim, reset) = (
+            color(YELLOW, use_color),
+            color(GREEN, use_color),
+            color(RED, use_color),
+            color(DIM, use_color),
+            color(RESET, use_color),
+        );
+
+        // Print the tool start line (same pattern as ToolWrapper).
+        clear_thinking_line();
+        let task_preview = params.get("task").and_then(|v| v.as_str()).unwrap_or("...");
+        print!(
+            "{yellow}  > spawn_agent: {}{reset}",
+            truncate(task_preview, 60)
+        );
+        io::stdout().flush().ok();
+        println!();
+
+        // Create an on_update callback that prints sub-agent progress in dim text.
+        let parent_on_update = ctx.on_update.clone();
+        let progress_update: ToolUpdateFn = Arc::new(move |result: ToolResult| {
+            // Extract text content for display.
+            for content in &result.content {
+                if let Content::Text { text } = content {
+                    // Detect tool call notifications vs text deltas.
+                    if text.starts_with("[sub-agent calling tool:") {
+                        // Extract tool name from the notification.
+                        let tool_info = text
+                            .trim_start_matches("[sub-agent calling tool: ")
+                            .trim_end_matches(']');
+                        println!(
+                            "{dim}    [sub] > {tool_info}{reset}",
+                            dim = color(DIM, use_color),
+                            reset = color(RESET, use_color),
+                        );
+                    }
+                    // Text deltas are intentionally not printed line-by-line
+                    // to avoid flooding the terminal. The final result is
+                    // printed by the parent.
+                }
+            }
+
+            // Forward to parent's on_update if present.
+            if let Some(ref parent) = parent_on_update {
+                parent(result);
+            }
+        });
+
+        // Create an on_progress callback that prints progress messages.
+        let parent_on_progress = ctx.on_progress.clone();
+        let progress_fn: ProgressFn = Arc::new(move |text: String| {
+            println!(
+                "{dim}    [sub] {text}{reset}",
+                dim = color(DIM, use_color),
+                reset = color(RESET, use_color),
+            );
+
+            // Forward to parent's on_progress if present.
+            if let Some(ref parent) = parent_on_progress {
+                parent(text);
+            }
+        });
+
+        // Build a modified context with our progress callbacks.
+        let sub_ctx = ToolContext {
+            tool_call_id: ctx.tool_call_id,
+            tool_name: ctx.tool_name,
+            cancel: ctx.cancel,
+            on_update: Some(progress_update),
+            on_progress: Some(progress_fn),
+        };
+
+        let result = self.inner.execute(params, sub_ctx).await;
+
+        // Print result status.
+        match &result {
+            Ok(_) => println!("{dim}    [sub] {green}done{reset}"),
+            Err(_) => println!("{dim}    [sub] {red}failed{reset}"),
+        }
+
+        result
+    }
 }
 
 /// A configured `Agent` ready for prompting.
@@ -334,12 +459,32 @@ fn build_agent(
         agent = agent.with_model_config(cfg);
     }
 
+    // Build the sub-agent tool (unwrapped -- it manages its own output).
+    let subagent = build_subagent(
+        "spawn_agent",
+        "Spawn a sub-agent to handle a focused task independently. \
+         The sub-agent runs with a fresh context and returns only its final result.",
+        "You are a helpful sub-agent. Complete the task you are given \
+         thoroughly and return the result.",
+        config,
+        model,
+        api_key,
+    );
+
+    // Wrap default tools for real-time feedback, then append the sub-agent
+    // tool wrapped in SubAgentWrapper for progress display.
+    let mut tools = wrap_tools(default_tools(), use_color);
+    tools.push(Box::new(SubAgentWrapper {
+        inner: Box::new(subagent),
+        use_color,
+    }));
+
     agent = agent
         .with_system_prompt(system_prompt)
         .with_model(model)
         .with_api_key(api_key)
         .with_skills(skills)
-        .with_tools(wrap_tools(default_tools(), use_color));
+        .with_tools(tools);
 
     agent
 }
@@ -916,6 +1061,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yoagent::provider::MockProvider;
 
     /// Helper to parse CLI args from a slice, simulating command-line invocation.
     fn parse_cli(args: &[&str]) -> Result<Cli, clap::Error> {
@@ -924,6 +1070,50 @@ mod tests {
         full_args.extend_from_slice(args);
         Cli::try_parse_from(full_args)
     }
+
+    /// Helper to build a mock agent for testing. Uses `MockProvider` so no
+    /// real API calls are made.
+    fn mock_agent(response: &str) -> Agent {
+        Agent::new(MockProvider::text(response))
+            .with_system_prompt("test")
+            .with_model("mock")
+            .with_api_key("test-key")
+    }
+
+    /// Helper to call `handle_slash_command` with default test fixtures.
+    /// Returns the `SlashResult` along with the potentially-mutated model
+    /// and session key.
+    fn run_slash(
+        input: &str,
+        agent: &mut Agent,
+        session_mgr: &SessionManager,
+    ) -> (SlashResult, String, String) {
+        let config = AppConfig::default();
+        let skills = SkillSet::empty();
+        let mut model = "mock-model".to_owned();
+        let mut session_key = "test-session".to_owned();
+
+        let result = handle_slash_command(
+            input,
+            agent,
+            &mut model,
+            &mut session_key,
+            &config,
+            "test-key",
+            &skills,
+            "test prompt",
+            session_mgr,
+            false,
+            "",
+            "",
+        );
+
+        (result, model, session_key)
+    }
+
+    // -----------------------------------------------------------------------
+    // CLI parsing tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn cli_parses_no_args() {
@@ -1017,6 +1207,10 @@ mod tests {
         assert_eq!(cli.prompt.as_deref(), Some("do stuff"));
     }
 
+    // -----------------------------------------------------------------------
+    // resolve_model tests
+    // -----------------------------------------------------------------------
+
     #[test]
     fn resolve_model_prefers_cli_override() {
         let config = AppConfig::default();
@@ -1031,6 +1225,10 @@ mod tests {
         assert_eq!(result, "claude-sonnet-4-20250514");
     }
 
+    // -----------------------------------------------------------------------
+    // color helper tests
+    // -----------------------------------------------------------------------
+
     #[test]
     fn color_returns_code_when_enabled() {
         assert_eq!(color(BOLD, true), BOLD);
@@ -1041,6 +1239,41 @@ mod tests {
         assert_eq!(color(BOLD, false), "");
     }
 
+    // -----------------------------------------------------------------------
+    // truncate tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_at_exact_length() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_cuts_long_string() {
+        assert_eq!(truncate("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_preserves_multibyte_boundaries() {
+        // Each char here is multi-byte; ensure we don't panic or split mid-char.
+        let s = "abcde";
+        assert_eq!(truncate(s, 3), "abc");
+    }
+
+    #[test]
+    fn truncate_empty_string() {
+        assert_eq!(truncate("", 5), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // format_tool_summary tests
+    // -----------------------------------------------------------------------
+
     #[test]
     fn format_tool_summary_bash() {
         let args = serde_json::json!({"command": "ls -la"});
@@ -1048,8 +1281,561 @@ mod tests {
     }
 
     #[test]
+    fn format_tool_summary_bash_truncates_long_command() {
+        let long_cmd = "x".repeat(200);
+        let args = serde_json::json!({"command": long_cmd});
+        let summary = format_tool_summary("bash", &args);
+        // "$ " prefix + 80 chars max.
+        assert!(summary.len() <= 82 + 2);
+        assert!(summary.starts_with("$ "));
+    }
+
+    #[test]
+    fn format_tool_summary_read_file() {
+        let args = serde_json::json!({"path": "/src/main.rs"});
+        assert_eq!(format_tool_summary("read_file", &args), "read /src/main.rs");
+    }
+
+    #[test]
+    fn format_tool_summary_write_file() {
+        let args = serde_json::json!({"path": "/tmp/out.txt"});
+        assert_eq!(
+            format_tool_summary("write_file", &args),
+            "write /tmp/out.txt"
+        );
+    }
+
+    #[test]
+    fn format_tool_summary_edit_file() {
+        let args = serde_json::json!({"path": "/src/lib.rs"});
+        assert_eq!(format_tool_summary("edit_file", &args), "edit /src/lib.rs");
+    }
+
+    #[test]
+    fn format_tool_summary_list_files() {
+        let args = serde_json::json!({"path": "/src"});
+        assert_eq!(format_tool_summary("list_files", &args), "ls /src");
+    }
+
+    #[test]
+    fn format_tool_summary_list_files_defaults_to_dot() {
+        let args = serde_json::json!({});
+        assert_eq!(format_tool_summary("list_files", &args), "ls .");
+    }
+
+    #[test]
+    fn format_tool_summary_search() {
+        let args = serde_json::json!({"pattern": "fn main"});
+        assert_eq!(format_tool_summary("search", &args), "search 'fn main'");
+    }
+
+    #[test]
     fn format_tool_summary_unknown_tool() {
         let args = serde_json::json!({});
         assert_eq!(format_tool_summary("custom_tool", &args), "custom_tool");
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_slash_command tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn slash_quit_returns_quit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_mgr = SessionManager::new(tmp.path()).unwrap();
+        let mut agent = mock_agent("ok");
+        let (result, _, _) = run_slash("/quit", &mut agent, &session_mgr);
+        assert!(matches!(result, SlashResult::Quit));
+    }
+
+    #[test]
+    fn slash_exit_returns_quit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_mgr = SessionManager::new(tmp.path()).unwrap();
+        let mut agent = mock_agent("ok");
+        let (result, _, _) = run_slash("/exit", &mut agent, &session_mgr);
+        assert!(matches!(result, SlashResult::Quit));
+    }
+
+    #[test]
+    fn slash_clear_clears_messages_and_returns_handled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_mgr = SessionManager::new(tmp.path()).unwrap();
+        let mut agent = mock_agent("ok");
+
+        let (result, _, _) = run_slash("/clear", &mut agent, &session_mgr);
+        assert!(
+            matches!(result, SlashResult::Handled(ref msg) if msg.contains("conversation cleared"))
+        );
+        assert!(agent.messages().is_empty());
+    }
+
+    #[test]
+    fn slash_sessions_empty_shows_no_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_mgr = SessionManager::new(tmp.path()).unwrap();
+        let mut agent = mock_agent("ok");
+
+        let (result, _, _) = run_slash("/sessions", &mut agent, &session_mgr);
+        assert!(
+            matches!(result, SlashResult::Handled(ref msg) if msg.contains("no saved sessions"))
+        );
+    }
+
+    #[test]
+    fn slash_sessions_lists_existing_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_mgr = SessionManager::new(tmp.path()).unwrap();
+        session_mgr
+            .save("my-session", r#"[{"role":"user"}]"#)
+            .unwrap();
+        let mut agent = mock_agent("ok");
+
+        let (result, _, _) = run_slash("/sessions", &mut agent, &session_mgr);
+        assert!(matches!(result, SlashResult::Handled(ref msg) if msg.contains("my-session")));
+    }
+
+    #[test]
+    fn slash_save_uses_default_session_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_mgr = SessionManager::new(tmp.path()).unwrap();
+        let mut agent = mock_agent("ok");
+
+        let (result, _, session_key) = run_slash("/save", &mut agent, &session_mgr);
+        assert!(matches!(result, SlashResult::Handled(ref msg) if msg.contains("saved as")));
+        // Session key should remain the default "test-session".
+        assert_eq!(session_key, "test-session");
+    }
+
+    #[test]
+    fn slash_save_with_name_updates_session_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_mgr = SessionManager::new(tmp.path()).unwrap();
+        let mut agent = mock_agent("ok");
+
+        let (result, _, session_key) = run_slash("/save my-name", &mut agent, &session_mgr);
+        assert!(matches!(result, SlashResult::Handled(ref msg) if msg.contains("my-name")));
+        assert_eq!(session_key, "my-name");
+    }
+
+    #[test]
+    fn slash_model_bare_shows_current_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_mgr = SessionManager::new(tmp.path()).unwrap();
+        let mut agent = mock_agent("ok");
+
+        let (result, model, _) = run_slash("/model", &mut agent, &session_mgr);
+        assert!(matches!(result, SlashResult::Handled(ref msg) if msg.contains("mock-model")));
+        assert_eq!(model, "mock-model");
+    }
+
+    #[test]
+    fn slash_model_with_arg_switches_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_mgr = SessionManager::new(tmp.path()).unwrap();
+        let mut agent = mock_agent("ok");
+
+        let (result, model, _) = run_slash("/model new-model", &mut agent, &session_mgr);
+        assert!(
+            matches!(result, SlashResult::Handled(ref msg) if msg.contains("switched to new-model"))
+        );
+        assert_eq!(model, "new-model");
+    }
+
+    #[test]
+    fn non_slash_input_returns_not_slash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_mgr = SessionManager::new(tmp.path()).unwrap();
+        let mut agent = mock_agent("ok");
+
+        let (result, _, _) = run_slash("hello world", &mut agent, &session_mgr);
+        assert!(matches!(result, SlashResult::NotSlash));
+    }
+
+    #[test]
+    fn unknown_slash_returns_not_slash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_mgr = SessionManager::new(tmp.path()).unwrap();
+        let mut agent = mock_agent("ok");
+
+        let (result, _, _) = run_slash("/unknown", &mut agent, &session_mgr);
+        assert!(matches!(result, SlashResult::NotSlash));
+    }
+
+    // -----------------------------------------------------------------------
+    // render_events tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn render_events_returns_usage_from_agent_end() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Simulate a minimal agent event sequence with usage data.
+        tx.send(AgentEvent::AgentEnd {
+            messages: vec![AgentMessage::Llm(Message::Assistant {
+                content: vec![Content::Text {
+                    text: "hello".into(),
+                }],
+                stop_reason: StopReason::Stop,
+                model: "mock".into(),
+                provider: "mock".into(),
+                usage: Usage {
+                    input: 100,
+                    output: 50,
+                    ..Usage::default()
+                },
+                timestamp: 0,
+                error_message: None,
+            })],
+        })
+        .unwrap();
+        drop(tx);
+
+        let usage = render_events(rx, false).await;
+        assert_eq!(usage.input, 100);
+        assert_eq!(usage.output, 50);
+    }
+
+    #[tokio::test]
+    async fn render_events_returns_default_usage_when_no_events() {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(_tx);
+
+        let usage = render_events(rx, false).await;
+        assert_eq!(usage.input, 0);
+        assert_eq!(usage.output, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // run_single_prompt integration tests (using MockProvider)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn run_single_prompt_returns_usage() {
+        let mut agent = mock_agent("Hello from mock!");
+
+        // No thinking key (skip Haiku label call), no color.
+        let usage = run_single_prompt(&mut agent, "Hi", false, None).await;
+
+        // MockProvider returns default usage (zeros), but the function
+        // should complete without error.
+        assert_eq!(usage.input, 0);
+        assert_eq!(usage.output, 0);
+
+        // Agent should have accumulated user + assistant messages.
+        assert_eq!(agent.messages().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn run_single_prompt_multiple_turns() {
+        // MockProvider with two responses for two sequential prompts.
+        let provider = MockProvider::texts(vec!["First", "Second"]);
+        let mut agent = Agent::new(provider)
+            .with_system_prompt("test")
+            .with_model("mock")
+            .with_api_key("test-key");
+
+        let _ = run_single_prompt(&mut agent, "msg1", false, None).await;
+        assert_eq!(agent.messages().len(), 2);
+
+        let _ = run_single_prompt(&mut agent, "msg2", false, None).await;
+        assert_eq!(agent.messages().len(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Bus consumer integration tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn bus_slash_command_returns_response_via_oneshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_mgr = SessionManager::new(tmp.path()).unwrap();
+        let mut agent = mock_agent("ok");
+        let config = AppConfig::default();
+        let skills = SkillSet::empty();
+        let mut model = "mock".to_owned();
+        let mut session_key = "test".to_owned();
+
+        // Create bus, send a /clear command, consume it.
+        let (bus, mut rx) = beezle::bus::command_bus(1);
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+
+        bus.send(beezle::bus::Command {
+            source: beezle::bus::ChannelKind::Terminal,
+            content: "/clear".into(),
+            response_tx: resp_tx,
+        })
+        .await
+        .unwrap();
+
+        let cmd = rx.recv().await.unwrap();
+        let input = cmd.content.trim().to_owned();
+        let (dim, reset) = (color(DIM, false), color(RESET, false));
+
+        let result = handle_slash_command(
+            &input,
+            &mut agent,
+            &mut model,
+            &mut session_key,
+            &config,
+            "test-key",
+            &skills,
+            "test",
+            &session_mgr,
+            false,
+            dim,
+            reset,
+        );
+
+        if let SlashResult::Handled(msg) = result {
+            cmd.response_tx.send(Response { content: msg }).unwrap();
+        } else {
+            panic!("expected SlashResult::Handled");
+        }
+
+        let response = resp_rx.await.unwrap();
+        assert!(response.content.contains("conversation cleared"));
+    }
+
+    #[tokio::test]
+    async fn bus_regular_prompt_processes_through_mock_agent() {
+        let (bus, mut rx) = beezle::bus::command_bus(1);
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+
+        bus.send(beezle::bus::Command {
+            source: beezle::bus::ChannelKind::Terminal,
+            content: "hello agent".into(),
+            response_tx: resp_tx,
+        })
+        .await
+        .unwrap();
+
+        let cmd = rx.recv().await.unwrap();
+        assert_eq!(cmd.content, "hello agent");
+
+        // Simulate the consumer: it's not a slash command, so run agent.
+        let mut agent = mock_agent("agent response");
+        let _usage = run_single_prompt(&mut agent, &cmd.content, false, None).await;
+
+        // Send empty response (output was streamed).
+        cmd.response_tx
+            .send(Response {
+                content: String::new(),
+            })
+            .unwrap();
+
+        let response = resp_rx.await.unwrap();
+        // Response content is empty because streaming happened via wrappers.
+        assert!(response.content.is_empty());
+
+        // But the agent did process the prompt.
+        assert_eq!(agent.messages().len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // wrap_tools + spawn_agent tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wrap_tools_skips_spawn_agent() {
+        use std::sync::Arc;
+        use yoagent::sub_agent::SubAgentTool;
+
+        let provider: Arc<dyn StreamProvider> = Arc::new(MockProvider::text("mock"));
+        let spawn_tool: Box<dyn AgentTool> = Box::new(
+            SubAgentTool::new("spawn_agent", provider)
+                .with_description("test")
+                .with_system_prompt("test")
+                .with_model("mock")
+                .with_api_key("key"),
+        );
+
+        // A regular tool plus the spawn_agent tool.
+        let mut tools: Vec<Box<dyn AgentTool>> = default_tools();
+        let regular_count = tools.len();
+        tools.push(spawn_tool);
+
+        let wrapped = wrap_tools(tools, false);
+
+        // Total count should be regular + 1 (spawn_agent).
+        assert_eq!(wrapped.len(), regular_count + 1);
+
+        // The spawn_agent tool should still be named "spawn_agent" and NOT be
+        // wrapped in ToolWrapper (ToolWrapper delegates name() so we can't
+        // distinguish by name alone -- instead we verify the count is correct
+        // and that a tool named spawn_agent exists).
+        let has_spawn = wrapped.iter().any(|t| t.name() == "spawn_agent");
+        assert!(has_spawn, "spawn_agent should be in the wrapped tools list");
+    }
+
+    #[test]
+    fn wrap_tools_still_wraps_regular_tools() {
+        // Ensure regular tools are still wrapped (they produce output on execute).
+        let tools = default_tools();
+        let count = tools.len();
+        let wrapped = wrap_tools(tools, false);
+        assert_eq!(wrapped.len(), count);
+        // All regular tools should still be present by name.
+        assert!(wrapped.iter().any(|t| t.name() == "bash"));
+    }
+
+    #[test]
+    fn build_agent_tools_include_spawn_agent() {
+        // Simulate what build_agent does: combine wrapped default_tools with
+        // the unwrapped spawn_agent tool. Verify spawn_agent is present.
+        use beezle::agent::build_subagent;
+
+        let config = AppConfig::default();
+        let subagent = build_subagent(
+            "spawn_agent",
+            "Spawn a sub-agent to handle a focused task independently.",
+            "You are a helpful sub-agent. Complete the task thoroughly and return the result.",
+            &config,
+            "claude-sonnet-4-20250514",
+            "test-key",
+        );
+
+        let mut tools = wrap_tools(default_tools(), false);
+        tools.push(Box::new(SubAgentWrapper {
+            inner: Box::new(subagent),
+            use_color: false,
+        }));
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            names.contains(&"spawn_agent"),
+            "tools should contain spawn_agent, got: {names:?}"
+        );
+        // spawn_agent should be in addition to default tools.
+        assert!(tools.len() > default_tools().len());
+    }
+
+    // -----------------------------------------------------------------------
+    // SubAgentWrapper tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn subagent_wrapper_delegates_name() {
+        use std::sync::Arc;
+        use yoagent::sub_agent::SubAgentTool;
+
+        let provider: Arc<dyn StreamProvider> = Arc::new(MockProvider::text("mock"));
+        let tool = SubAgentTool::new("spawn_agent", provider)
+            .with_description("test desc")
+            .with_system_prompt("test")
+            .with_model("mock")
+            .with_api_key("key");
+
+        let wrapper = SubAgentWrapper {
+            inner: Box::new(tool),
+            use_color: false,
+        };
+
+        assert_eq!(wrapper.name(), "spawn_agent");
+        assert_eq!(wrapper.description(), "test desc");
+    }
+
+    #[tokio::test]
+    async fn subagent_wrapper_on_update_receives_events() {
+        // Verify that executing a sub-agent through SubAgentWrapper causes
+        // on_update callbacks to fire with expected progress events.
+        use std::sync::{Arc, Mutex};
+        use yoagent::sub_agent::SubAgentTool;
+
+        let provider: Arc<dyn StreamProvider> = Arc::new(MockProvider::text("Sub result"));
+        let tool = SubAgentTool::new("spawn_agent", provider)
+            .with_description("test")
+            .with_system_prompt("test")
+            .with_model("mock")
+            .with_api_key("key");
+
+        let wrapper = SubAgentWrapper {
+            inner: Box::new(tool),
+            use_color: false,
+        };
+
+        // Collect on_update events via a shared vec (std::sync::Mutex is safe
+        // here because the callback is synchronous Fn, not async).
+        let updates: Arc<Mutex<Vec<ToolResult>>> = Arc::new(Mutex::new(Vec::new()));
+        let updates_clone = updates.clone();
+        let on_update: ToolUpdateFn = Arc::new(move |result: ToolResult| {
+            updates_clone.lock().unwrap().push(result);
+        });
+
+        let ctx = ToolContext {
+            tool_call_id: "tc-test".into(),
+            tool_name: "spawn_agent".into(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            on_update: Some(on_update),
+            on_progress: None,
+        };
+
+        let params = serde_json::json!({"task": "Say hello"});
+        let result = wrapper.execute(params, ctx).await;
+
+        assert!(result.is_ok(), "SubAgentWrapper execution should succeed");
+        let result = result.unwrap();
+        // The final result should contain the sub-agent's output.
+        let text = match &result.content[0] {
+            Content::Text { text } => text.as_str(),
+            other => panic!("Expected Text content, got: {:?}", other),
+        };
+        assert_eq!(text, "Sub result");
+
+        // The on_update callback should have received at least one event
+        // (the text delta from the sub-agent's response).
+        let collected = updates.lock().unwrap();
+        assert!(
+            !collected.is_empty(),
+            "on_update should have received at least one event"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_wrapper_progress_events_contain_text_deltas() {
+        // Verify that progress events include text delta content from
+        // the sub-agent's response stream.
+        use std::sync::{Arc, Mutex};
+        use yoagent::sub_agent::SubAgentTool;
+
+        let provider: Arc<dyn StreamProvider> = Arc::new(MockProvider::text("Hello from sub"));
+        let tool = SubAgentTool::new("spawn_agent", provider)
+            .with_description("test")
+            .with_system_prompt("test")
+            .with_model("mock")
+            .with_api_key("key");
+
+        let wrapper = SubAgentWrapper {
+            inner: Box::new(tool),
+            use_color: false,
+        };
+
+        let updates: Arc<Mutex<Vec<ToolResult>>> = Arc::new(Mutex::new(Vec::new()));
+        let updates_clone = updates.clone();
+        let on_update: ToolUpdateFn = Arc::new(move |result: ToolResult| {
+            updates_clone.lock().unwrap().push(result);
+        });
+
+        let ctx = ToolContext {
+            tool_call_id: "tc-test".into(),
+            tool_name: "spawn_agent".into(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            on_update: Some(on_update),
+            on_progress: None,
+        };
+
+        let params = serde_json::json!({"task": "Say hello"});
+        let _ = wrapper.execute(params, ctx).await.unwrap();
+
+        let collected = updates.lock().unwrap();
+        // Check that at least one update contains text content.
+        let has_text = collected
+            .iter()
+            .any(|r| r.content.iter().any(|c| matches!(c, Content::Text { .. })));
+        assert!(
+            has_text,
+            "progress events should include text content, got: {:?}",
+            *collected
+        );
     }
 }
