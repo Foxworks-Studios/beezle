@@ -292,8 +292,12 @@ fn clear_thinking_line() {
 
 /// Runs a single prompt through the agent and prints the response.
 ///
-/// Shows a thinking indicator (contextual if Anthropic, static fallback
-/// otherwise) while waiting for the first agent event.
+/// Shows a thinking indicator while waiting for the agent loop to complete.
+///
+/// **Note:** `agent.prompt()` awaits the entire agent loop internally before
+/// returning the event receiver. Events are buffered, not truly streamed to
+/// us in real time. The thinking indicator covers this wait. Once we have
+/// the receiver, we drain events immediately.
 ///
 /// # Arguments
 ///
@@ -312,122 +316,118 @@ async fn run_single_prompt(
     use_color: bool,
     thinking_api_key: Option<&str>,
 ) -> Usage {
-    let mut last_usage = Usage::default();
-    let mut in_text = false;
-    let mut thinking = true;
-
     let (dim, reset_code) = (color(DIM, use_color), color(RESET, use_color));
 
-    // Show the thinking indicator BEFORE starting the prompt so the user
-    // sees feedback immediately, even while the HTTP connection is opening.
+    // Show thinking indicator immediately so the user sees feedback while
+    // agent.prompt() runs the entire agent loop internally.
     let static_label = thinking_label();
     print!("{dim}  {static_label}...{reset_code}");
     io::stdout().flush().ok();
 
-    let mut rx = agent.prompt(prompt).await;
-
-    // Optionally spawn a Haiku call to get a contextual label.
-    let label_handle = thinking_api_key.map(|key| {
+    // Optionally fire a Haiku call in parallel for a contextual label.
+    // It races against agent.prompt() — whichever finishes first wins.
+    let label_task = thinking_api_key.map(|key| {
         let key = key.to_owned();
         let msg = prompt.to_owned();
         tokio::spawn(async move { fetch_thinking_label(&key, &msg).await })
     });
-    // Pin the future so we can poll it in select!.
-    // Wrap in an Option so we can take() it after it resolves.
-    let mut label_fut = label_handle.map(Box::pin);
 
-    loop {
-        tokio::select! {
-            // If the contextual label arrives while still thinking, update it.
-            result = async { label_fut.as_mut().unwrap().as_mut().await },
-                if thinking && label_fut.is_some() =>
-            {
-                // Take the future so we don't poll it again.
-                label_fut = None;
-                if let Ok(Some(label)) = result {
-                    clear_thinking_line();
-                    print!("{dim}  {label}...{reset_code}");
-                    io::stdout().flush().ok();
+    // agent.prompt() awaits the full agent loop — all events are buffered
+    // in the unbounded channel by the time it returns.
+    let rx = agent.prompt(prompt).await;
+
+    // Clear the thinking indicator now that the loop is done.
+    clear_thinking_line();
+
+    // Abort the label task if it's still running — we no longer need it.
+    if let Some(handle) = label_task {
+        handle.abort();
+    }
+
+    // Drain buffered events and render output.
+    render_events(rx, use_color).await
+}
+
+/// Drains agent events from the receiver and renders them to stdout.
+///
+/// # Arguments
+///
+/// * `rx` - The event receiver (events are already buffered).
+/// * `use_color` - Whether to use ANSI color output.
+///
+/// # Returns
+///
+/// The final token usage from the turn.
+async fn render_events(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    use_color: bool,
+) -> Usage {
+    let mut last_usage = Usage::default();
+    let mut in_text = false;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ToolExecutionStart {
+                tool_name, args, ..
+            } => {
+                if in_text {
+                    println!();
+                    in_text = false;
+                }
+                let (yellow, reset) = (color(YELLOW, use_color), color(RESET, use_color));
+                let summary = format_tool_summary(&tool_name, &args);
+                print!("{yellow}  > {summary}{reset}");
+                io::stdout().flush().ok();
+            }
+            AgentEvent::ToolExecutionEnd { is_error, .. } => {
+                let (green, red, reset) = (
+                    color(GREEN, use_color),
+                    color(RED, use_color),
+                    color(RESET, use_color),
+                );
+                if is_error {
+                    println!(" {red}x{reset}");
+                } else {
+                    println!(" {green}ok{reset}");
                 }
             }
-            // Main agent events.
-            event = rx.recv() => {
-                let Some(event) = event else { break };
-
-                if thinking {
-                    clear_thinking_line();
-                    thinking = false;
+            AgentEvent::MessageUpdate {
+                delta: StreamDelta::Text { delta },
+                ..
+            } => {
+                if !in_text {
+                    println!();
+                    in_text = true;
                 }
-
-                match event {
-                    AgentEvent::ToolExecutionStart {
-                        tool_name, args, ..
-                    } => {
-                        if in_text {
-                            println!();
-                            in_text = false;
-                        }
-                        let (yellow, reset) =
-                            (color(YELLOW, use_color), color(RESET, use_color));
-                        let summary = format_tool_summary(&tool_name, &args);
-                        print!("{yellow}  > {summary}{reset}");
-                        io::stdout().flush().ok();
-                    }
-                    AgentEvent::ToolExecutionEnd { is_error, .. } => {
-                        let (green, red, reset) = (
-                            color(GREEN, use_color),
-                            color(RED, use_color),
-                            color(RESET, use_color),
-                        );
-                        if is_error {
-                            println!(" {red}x{reset}");
-                        } else {
-                            println!(" {green}ok{reset}");
-                        }
-                    }
-                    AgentEvent::MessageUpdate {
-                        delta: StreamDelta::Text { delta },
+                print!("{delta}");
+                io::stdout().flush().ok();
+            }
+            AgentEvent::MessageEnd {
+                message:
+                    AgentMessage::Llm(Message::Assistant {
+                        stop_reason: StopReason::Error,
+                        error_message,
                         ..
-                    } => {
-                        if !in_text {
-                            println!();
-                            in_text = true;
-                        }
-                        print!("{delta}");
-                        io::stdout().flush().ok();
+                    }),
+            } => {
+                if in_text {
+                    println!();
+                    in_text = false;
+                }
+                let (red, reset) = (color(RED, use_color), color(RESET, use_color));
+                let msg = error_message.as_deref().unwrap_or("unknown error");
+                tracing::error!("{msg}");
+                println!("{red}  error: {msg}{reset}");
+            }
+            AgentEvent::AgentEnd { messages } => {
+                for msg in messages.iter().rev() {
+                    if let AgentMessage::Llm(Message::Assistant { usage, .. }) = msg {
+                        last_usage = usage.clone();
+                        break;
                     }
-                    AgentEvent::MessageEnd {
-                        message:
-                            AgentMessage::Llm(Message::Assistant {
-                                stop_reason: StopReason::Error,
-                                error_message,
-                                ..
-                            }),
-                    } => {
-                        if in_text {
-                            println!();
-                            in_text = false;
-                        }
-                        let (red, reset) =
-                            (color(RED, use_color), color(RESET, use_color));
-                        let msg = error_message.as_deref().unwrap_or("unknown error");
-                        tracing::error!("{msg}");
-                        println!("{red}  error: {msg}{reset}");
-                    }
-                    AgentEvent::AgentEnd { messages } => {
-                        for msg in messages.iter().rev() {
-                            if let AgentMessage::Llm(Message::Assistant {
-                                usage, ..
-                            }) = msg
-                            {
-                                last_usage = usage.clone();
-                                break;
-                            }
-                        }
-                    }
-                    _ => {}
                 }
             }
+            _ => {}
         }
     }
 
