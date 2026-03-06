@@ -307,25 +307,120 @@ fn load_skills(cli_dirs: &[PathBuf]) -> SkillSet {
     })
 }
 
+/// Returns a random capitalized thinking-state gerund for the status indicator.
+///
+/// Picks from a static list using the nanosecond timestamp as a simple fast
+/// random source.
+fn thinking_label() -> &'static str {
+    const LABELS: &[&str] = &[
+        "Thinking",
+        "Pondering",
+        "Reasoning",
+        "Tinkering",
+        "Noodling",
+        "Mulling",
+        "Brewing",
+        "Conjuring",
+        "Scheming",
+        "Hatching",
+    ];
+    let idx = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as usize
+        % LABELS.len();
+    LABELS[idx]
+}
+
+/// Prints the status line showing the current thinking label.
+///
+/// Format matches Claude Code style: `* Verb...` with a colored asterisk.
+fn print_status_line(label: &str, yellow: &str, dim: &str, reset: &str) {
+    print!("\r{yellow}*{reset} {dim}{label}...{reset}");
+    io::stdout().flush().ok();
+}
+
+/// Clears the current status/thinking line by overwriting with spaces.
+fn clear_status_line() {
+    print!("\r\x1b[2K");
+    io::stdout().flush().ok();
+}
+
+/// Fetches a contextual thinking label by asking a fast model to generate
+/// a whimsical gerund related to the user's message.
+///
+/// Returns `None` if the call fails or produces empty output.
+///
+/// # Arguments
+///
+/// * `api_key` - Anthropic API key or OAuth token.
+/// * `user_prompt` - The user's message to derive the label from.
+async fn fetch_thinking_label(api_key: &str, user_prompt: &str) -> Option<String> {
+    let system = "\
+Analyze this message and come up with a single positive, cheerful and delightful \
+verb in gerund form that's related to the message. Only include the word with no \
+other text or punctuation. The word should have the first letter capitalized. Add \
+some whimsy and surprise to entertain the user. Ensure the word is highly relevant \
+to the user's message. Synonyms are welcome, including obscure words. Be careful \
+to avoid words that might look alarming or concerning to the software engineer \
+seeing it as a status notification, such as Connecting, Disconnecting, Retrying, \
+Lagging, Freezing, etc. NEVER use a destructive word, such as Terminating, \
+Killing, Deleting, Destroying, Stopping, Exiting, or similar. NEVER use a word \
+that may be derogatory, offensive, or inappropriate in a non-coding context, \
+such as Penetrating.";
+
+    let mut agent = Agent::new(AnthropicProvider)
+        .with_model("claude-haiku-4-5-20251001")
+        .with_api_key(api_key)
+        .with_system_prompt(system);
+
+    let mut rx = agent.prompt(user_prompt).await;
+    let mut result = String::new();
+
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::MessageUpdate {
+            delta: StreamDelta::Text { delta },
+            ..
+        } = event
+        {
+            result.push_str(&delta);
+        }
+    }
+
+    agent.finish().await;
+
+    let label = result.trim().to_owned();
+    if label.is_empty() { None } else { Some(label) }
+}
+
 /// Runs a prompt through the agent using an event-driven loop.
 ///
 /// Spawns the agent loop on a background task via `agent.prompt()`, then
-/// processes streamed `AgentEvent`s in real time. Supports Ctrl+C cancellation
-/// via `agent.abort()`. After the loop, `agent.finish()` restores agent state.
+/// processes streamed `AgentEvent`s in real time. Shows a thinking indicator
+/// while waiting for the first event. Supports Ctrl+C cancellation via
+/// `agent.abort()`. After the loop, `agent.finish()` restores agent state.
 ///
 /// # Arguments
 ///
 /// * `agent` - The agent to prompt.
 /// * `prompt` - The user's prompt text.
 /// * `use_color` - Whether to use ANSI color output.
+/// * `thinking_api_key` - If `Some`, uses Haiku to generate a contextual
+///   thinking label. Falls back to a random static label if `None` or on error.
 ///
 /// # Returns
 ///
 /// The final token usage from the turn.
-async fn run_prompt(agent: &mut Agent, prompt: &str, use_color: bool) -> Usage {
+async fn run_prompt(
+    agent: &mut Agent,
+    prompt: &str,
+    use_color: bool,
+    thinking_api_key: Option<&str>,
+) -> Usage {
     let mut rx = agent.prompt(prompt).await;
     let mut last_usage = Usage::default();
     let mut tool_starts: HashMap<String, Instant> = HashMap::new();
+    let mut streaming_text = false;
 
     let (yellow, green, red, dim, reset) = (
         color(YELLOW, use_color),
@@ -335,14 +430,46 @@ async fn run_prompt(agent: &mut Agent, prompt: &str, use_color: bool) -> Usage {
         color(RESET, use_color),
     );
 
+    // Show a static fallback immediately so it never looks frozen.
+    let mut current_label = thinking_label().to_owned();
+    print_status_line(&current_label, yellow, dim, reset);
+
+    // Optionally spawn a Haiku call to get a contextual label.
+    let label_handle = thinking_api_key.map(|key| {
+        let key = key.to_owned();
+        let msg = prompt.to_owned();
+        tokio::spawn(async move { fetch_thinking_label(&key, &msg).await })
+    });
+    let mut label_fut = label_handle.map(Box::pin);
+
     loop {
         tokio::select! {
+            // If the contextual label arrives, update the status line.
+            result = async { label_fut.as_mut().unwrap().as_mut().await },
+                if label_fut.is_some() =>
+            {
+                label_fut = None;
+                if let Ok(Some(label)) = result {
+                    current_label = label;
+                    if !streaming_text {
+                        clear_status_line();
+                        print_status_line(&current_label, yellow, dim, reset);
+                    }
+                }
+            }
             event = rx.recv() => {
                 let Some(event) = event else { break };
+
                 match event {
                     AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args, .. } => {
+                        clear_status_line();
+                        if streaming_text {
+                            println!();
+                            streaming_text = false;
+                        }
                         tool_starts.insert(tool_call_id.clone(), Instant::now());
                         let summary = format_tool_summary(&tool_name, &args);
+                        // Print tool line without newline; ToolExecutionEnd appends result.
                         print!("{yellow}  > {summary}{reset}");
                         io::stdout().flush().ok();
                     }
@@ -357,21 +484,46 @@ async fn run_prompt(agent: &mut Agent, prompt: &str, use_color: bool) -> Usage {
                         } else {
                             println!(" {green}ok{duration}{reset}");
                         }
+                        print_status_line(&current_label, yellow, dim, reset);
                     }
                     AgentEvent::MessageUpdate { delta: StreamDelta::Text { delta }, .. } => {
+                        // During text streaming, hide the status line.
+                        if !streaming_text {
+                            clear_status_line();
+                            streaming_text = true;
+                        }
                         print!("{delta}");
                         io::stdout().flush().ok();
                     }
                     AgentEvent::MessageUpdate { delta: StreamDelta::Thinking { delta }, .. } => {
+                        if !streaming_text {
+                            clear_status_line();
+                            streaming_text = true;
+                        }
                         print!("{dim}{delta}{reset}");
                         io::stdout().flush().ok();
                     }
                     AgentEvent::MessageEnd { message: AgentMessage::Llm(Message::Assistant {
                         stop_reason: StopReason::Error, error_message, ..
                     }) } => {
+                        clear_status_line();
+                        if streaming_text {
+                            println!();
+                            streaming_text = false;
+                        }
                         let msg = error_message.as_deref().unwrap_or("unknown error");
                         tracing::error!("{msg}");
                         println!("{red}  error: {msg}{reset}");
+                        print_status_line(&current_label, yellow, dim, reset);
+                    }
+                    AgentEvent::MessageEnd { .. } => {
+                        // Non-error message end: text streaming done, re-show status.
+                        if streaming_text {
+                            println!();
+                            streaming_text = false;
+                        }
+                        clear_status_line();
+                        print_status_line(&current_label, yellow, dim, reset);
                     }
                     AgentEvent::AgentEnd { messages } => {
                         for msg in messages.iter().rev() {
@@ -382,10 +534,14 @@ async fn run_prompt(agent: &mut Agent, prompt: &str, use_color: bool) -> Usage {
                         }
                     }
                     AgentEvent::ProgressMessage { text, .. } => {
+                        clear_status_line();
                         println!("{dim}  {text}{reset}");
+                        print_status_line(&current_label, yellow, dim, reset);
                     }
                     AgentEvent::InputRejected { reason } => {
+                        clear_status_line();
                         println!("{red}  rejected: {reason}{reset}");
+                        print_status_line(&current_label, yellow, dim, reset);
                     }
                     _ => {}
                 }
@@ -395,6 +551,12 @@ async fn run_prompt(agent: &mut Agent, prompt: &str, use_color: bool) -> Usage {
                 break;
             }
         }
+    }
+
+    // Clean up the persistent status line.
+    clear_status_line();
+    if streaming_text {
+        println!();
     }
 
     agent.finish().await;
@@ -649,6 +811,13 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_default();
     let system_prompt = build_effective_system_prompt(&base_prompt, &memory_content);
 
+    // Only use dynamic thinking labels for Anthropic (needs a Haiku call).
+    let thinking_key: Option<&str> = if app_config.agent.default_provider != "ollama" {
+        Some(&api_key)
+    } else {
+        None
+    };
+
     let mut agent = build_agent(
         &app_config,
         &model,
@@ -689,7 +858,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Single-shot mode: run one prompt and exit.
     if let Some(ref prompt_text) = cli.prompt {
-        let usage = run_prompt(&mut agent, prompt_text, use_color).await;
+        let usage = run_prompt(&mut agent, prompt_text, use_color, thinking_key).await;
         print_usage(&usage, use_color);
         // Save single-shot session too.
         if let Ok(json) = agent.save_messages() {
@@ -752,7 +921,7 @@ async fn main() -> anyhow::Result<()> {
             }
             SlashResult::NotSlash => {
                 // Regular prompt — send to agent, respond via oneshot.
-                let usage = run_prompt(&mut agent, &input, use_color).await;
+                let usage = run_prompt(&mut agent, &input, use_color, thinking_key).await;
                 print_usage(&usage, use_color);
                 println!();
 
@@ -1254,7 +1423,7 @@ mod tests {
 
         // Simulate the consumer: it's not a slash command, so run agent.
         let mut agent = mock_agent("agent response");
-        let _usage = run_prompt(&mut agent, &cmd.content, false).await;
+        let _usage = run_prompt(&mut agent, &cmd.content, false, None).await;
 
         // Send empty response (output was streamed).
         cmd.response_tx
@@ -1353,7 +1522,7 @@ mod tests {
 
         // run_prompt will replace run_single_prompt with a streamlined
         // event-driven loop. MockProvider returns zero usage by default.
-        let usage = run_prompt(&mut agent, "hi", false).await;
+        let usage = run_prompt(&mut agent, "hi", false, None).await;
 
         assert_eq!(usage.input, 0);
         assert_eq!(usage.output, 0);
@@ -1369,11 +1538,22 @@ mod tests {
             .with_model("mock")
             .with_api_key("test-key");
 
-        let _ = run_prompt(&mut agent, "msg1", false).await;
+        let _ = run_prompt(&mut agent, "msg1", false, None).await;
         assert_eq!(agent.messages().len(), 2);
 
-        let _ = run_prompt(&mut agent, "msg2", false).await;
+        let _ = run_prompt(&mut agent, "msg2", false, None).await;
         assert_eq!(agent.messages().len(), 4);
+    }
+
+    #[test]
+    fn thinking_label_returns_nonempty_capitalized_gerund() {
+        let label = thinking_label();
+        assert!(!label.is_empty(), "thinking label should not be empty");
+        // First character should be uppercase (capitalized gerunds).
+        assert!(
+            label.chars().next().unwrap().is_ascii_uppercase(),
+            "thinking label should start with an uppercase letter, got: {label}"
+        );
     }
 
     #[tokio::test]
@@ -1398,6 +1578,6 @@ mod tests {
             .with_tools(default_tools());
 
         // Should process tool execution events and return without panicking.
-        let _usage = run_prompt(&mut agent, "run a command", false).await;
+        let _usage = run_prompt(&mut agent, "run a command", false, None).await;
     }
 }
