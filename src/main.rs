@@ -10,6 +10,7 @@ use clap::Parser;
 
 use beezle::config::{self, AppConfig, is_config_complete, load_config, run_onboarding};
 use beezle::context;
+use beezle::session::SessionManager;
 use yoagent::agent::Agent;
 use yoagent::provider::{AnthropicProvider, ModelConfig, OpenAiCompatProvider};
 use yoagent::skills::SkillSet;
@@ -83,7 +84,7 @@ fn print_banner(use_color: bool) {
         color(RESET, use_color),
     );
     println!("\n{bold}{cyan}  beezle{reset} {dim}-- ai coding agent{reset}");
-    println!("{dim}  Type /quit to exit, /clear to reset{reset}\n");
+    println!("{dim}  /quit /clear /save /sessions /model{reset}\n");
 }
 
 fn print_usage(usage: &Usage, use_color: bool) {
@@ -385,15 +386,10 @@ async fn main() -> anyhow::Result<()> {
         app_config = run_onboarding(app_config, &config_path, &mut reader, &mut writer)?;
     }
 
-    // Handle --resume stub.
-    if let Some(ref key) = cli.resume {
-        let (dim, reset) = (color(DIM, use_color), color(RESET, use_color));
-        if key.is_empty() {
-            println!("{dim}  (session resume not yet implemented){reset}");
-        } else {
-            println!("{dim}  (session resume for '{key}' not yet implemented){reset}");
-        }
-    }
+    // Initialize session manager.
+    let beezle_home = config::beezle_home()?;
+    let session_mgr = SessionManager::new(&beezle_home.join("sessions"))?;
+    let mut session_key = SessionManager::generate_key();
 
     let model = resolve_model(&app_config, cli.model.as_deref());
     let api_key = resolve_api_key(&app_config);
@@ -421,10 +417,43 @@ async fn main() -> anyhow::Result<()> {
         &system_prompt,
     );
 
+    // Resume a previous session if requested.
+    if let Some(ref resume_key) = cli.resume {
+        let (dim, reset) = (color(DIM, use_color), color(RESET, use_color));
+        let key = if resume_key.is_empty() {
+            // --resume with no key: load most recent.
+            session_mgr.most_recent()?
+        } else {
+            Some(resume_key.clone())
+        };
+
+        match key {
+            Some(k) => match session_mgr.load(&k) {
+                Ok(json) => {
+                    agent
+                        .restore_messages(&json)
+                        .map_err(|e| anyhow::anyhow!("failed to restore session: {e}"))?;
+                    session_key = k.clone();
+                    println!("{dim}  (resumed session: {k}){reset}");
+                }
+                Err(e) => {
+                    println!("{dim}  (could not resume: {e}){reset}");
+                }
+            },
+            None => {
+                println!("{dim}  (no previous sessions found){reset}");
+            }
+        }
+    }
+
     // Single-shot mode: run one prompt and exit.
     if let Some(ref prompt_text) = cli.prompt {
         let usage = run_single_prompt(&mut agent, prompt_text, use_color).await;
         print_usage(&usage, use_color);
+        // Save single-shot session too.
+        if let Ok(json) = agent.save_messages() {
+            let _ = session_mgr.save(&session_key, &json);
+        }
         return Ok(());
     }
 
@@ -479,6 +508,43 @@ async fn main() -> anyhow::Result<()> {
                 println!("{dim}  (conversation cleared){reset}\n");
                 continue;
             }
+            "/sessions" => {
+                match session_mgr.list() {
+                    Ok(sessions) if sessions.is_empty() => {
+                        println!("{dim}  (no saved sessions){reset}\n");
+                    }
+                    Ok(sessions) => {
+                        println!("{dim}  saved sessions:{reset}");
+                        for s in &sessions {
+                            let kb = s.size_bytes / 1024;
+                            println!("{dim}    {:<30} ({kb} KB){reset}", s.key);
+                        }
+                        println!();
+                    }
+                    Err(e) => {
+                        println!("{dim}  (error listing sessions: {e}){reset}\n");
+                    }
+                }
+                continue;
+            }
+            s if s.starts_with("/save") => {
+                let name = s.trim_start_matches("/save").trim();
+                let key = if name.is_empty() {
+                    session_key.as_str()
+                } else {
+                    // Update session key to the user-chosen name.
+                    session_key = name.to_owned();
+                    name
+                };
+                match agent.save_messages() {
+                    Ok(json) => match session_mgr.save(key, &json) {
+                        Ok(_) => println!("{dim}  (saved as '{key}'){reset}\n"),
+                        Err(e) => println!("{dim}  (save error: {e}){reset}\n"),
+                    },
+                    Err(e) => println!("{dim}  (save error: {e}){reset}\n"),
+                }
+                continue;
+            }
             s if s.starts_with("/model ") => {
                 let new_model = s.trim_start_matches("/model ").trim();
                 agent = build_agent(
@@ -499,8 +565,18 @@ async fn main() -> anyhow::Result<()> {
         println!();
     }
 
+    // Auto-save session on exit.
     let (dim, reset) = (color(DIM, use_color), color(RESET, use_color));
-    println!("\n{dim}  bye{reset}\n");
+    if let Ok(json) = agent.save_messages()
+        && !json.is_empty()
+        && json != "[]"
+    {
+        match session_mgr.save(&session_key, &json) {
+            Ok(_) => println!("{dim}  (session saved: {session_key}){reset}"),
+            Err(e) => tracing::warn!("failed to save session on exit: {e}"),
+        }
+    }
+    println!("{dim}  bye{reset}\n");
     Ok(())
 }
 
