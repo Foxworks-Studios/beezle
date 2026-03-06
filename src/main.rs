@@ -239,102 +239,193 @@ fn load_skills(cli_dirs: &[PathBuf]) -> SkillSet {
     })
 }
 
+/// Fetches a contextual thinking label by asking a fast model to generate
+/// a whimsical gerund related to the user's message.
+///
+/// Returns `None` if the call fails or produces empty output.
+///
+/// # Arguments
+///
+/// * `api_key` - Anthropic API key or OAuth token.
+/// * `user_prompt` - The user's message to derive the label from.
+async fn fetch_thinking_label(api_key: &str, user_prompt: &str) -> Option<String> {
+    let system = "\
+Analyze this message and come up with a single positive, cheerful and delightful \
+verb in gerund form that's related to the message. Only include the word with no \
+other text or punctuation. The word should have the first letter capitalized. Add \
+some whimsy and surprise to entertain the user. Ensure the word is highly relevant \
+to the user's message. Synonyms are welcome, including obscure words. Be careful \
+to avoid words that might look alarming or concerning to the software engineer \
+seeing it as a status notification, such as Connecting, Disconnecting, Retrying, \
+Lagging, Freezing, etc. NEVER use a destructive word, such as Terminating, \
+Killing, Deleting, Destroying, Stopping, Exiting, or similar. NEVER use a word \
+that may be derogatory, offensive, or inappropriate in a non-coding context, \
+such as Penetrating.";
+
+    let mut agent = Agent::new(AnthropicProvider)
+        .with_model("claude-haiku-4-5-20251001")
+        .with_api_key(api_key)
+        .with_system_prompt(system);
+
+    let mut rx = agent.prompt(user_prompt).await;
+    let mut result = String::new();
+
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::MessageUpdate {
+            delta: StreamDelta::Text { delta },
+            ..
+        } = event
+        {
+            result.push_str(&delta);
+        }
+    }
+
+    let label = result.trim().to_owned();
+    if label.is_empty() { None } else { Some(label) }
+}
+
+/// Clears the current thinking indicator line.
+fn clear_thinking_line() {
+    print!("\r                                        \r");
+    io::stdout().flush().ok();
+}
+
 /// Runs a single prompt through the agent and prints the response.
+///
+/// Shows a thinking indicator (contextual if Anthropic, static fallback
+/// otherwise) while waiting for the first agent event.
 ///
 /// # Arguments
 ///
 /// * `agent` - The agent to prompt.
 /// * `prompt` - The user's prompt text.
 /// * `use_color` - Whether to use ANSI color output.
+/// * `thinking_api_key` - If `Some`, uses Haiku to generate a contextual
+///   thinking label. Falls back to a random static label if `None` or on error.
 ///
 /// # Returns
 ///
 /// The final token usage from the turn.
-async fn run_single_prompt(agent: &mut Agent, prompt: &str, use_color: bool) -> Usage {
+async fn run_single_prompt(
+    agent: &mut Agent,
+    prompt: &str,
+    use_color: bool,
+    thinking_api_key: Option<&str>,
+) -> Usage {
     let mut rx = agent.prompt(prompt).await;
     let mut last_usage = Usage::default();
     let mut in_text = false;
     let mut thinking = true;
 
-    // Show a thinking indicator while waiting for the first response.
-    {
-        let (dim, reset) = (color(DIM, use_color), color(RESET, use_color));
-        let label = thinking_label();
-        print!("{dim}  {label}...{reset}");
-        io::stdout().flush().ok();
-    }
+    let (dim, reset_code) = (color(DIM, use_color), color(RESET, use_color));
 
-    while let Some(event) = rx.recv().await {
-        // Clear the thinking indicator on the first meaningful event.
-        if thinking {
-            // '\r' returns cursor to line start, then overwrite with spaces.
-            print!("\r                                \r");
-            io::stdout().flush().ok();
-            thinking = false;
-        }
+    // Show a static fallback immediately so it never looks frozen.
+    let static_label = thinking_label();
+    print!("{dim}  {static_label}...{reset_code}");
+    io::stdout().flush().ok();
 
-        match event {
-            AgentEvent::ToolExecutionStart {
-                tool_name, args, ..
-            } => {
-                if in_text {
-                    println!();
-                    in_text = false;
+    // Optionally spawn a Haiku call to get a contextual label.
+    let label_handle = thinking_api_key.map(|key| {
+        let key = key.to_owned();
+        let msg = prompt.to_owned();
+        tokio::spawn(async move { fetch_thinking_label(&key, &msg).await })
+    });
+    // Pin the future so we can poll it in select!.
+    // Wrap in an Option so we can take() it after it resolves.
+    let mut label_fut = label_handle.map(Box::pin);
+
+    loop {
+        tokio::select! {
+            // If the contextual label arrives while still thinking, update it.
+            result = async { label_fut.as_mut().unwrap().as_mut().await },
+                if thinking && label_fut.is_some() =>
+            {
+                // Take the future so we don't poll it again.
+                label_fut = None;
+                if let Ok(Some(label)) = result {
+                    clear_thinking_line();
+                    print!("{dim}  {label}...{reset_code}");
+                    io::stdout().flush().ok();
                 }
-                let (yellow, reset) = (color(YELLOW, use_color), color(RESET, use_color));
-                let summary = format_tool_summary(&tool_name, &args);
-                print!("{yellow}  > {summary}{reset}");
-                io::stdout().flush().ok();
             }
-            AgentEvent::ToolExecutionEnd { is_error, .. } => {
-                let (green, red, reset) = (
-                    color(GREEN, use_color),
-                    color(RED, use_color),
-                    color(RESET, use_color),
-                );
-                if is_error {
-                    println!(" {red}x{reset}");
-                } else {
-                    println!(" {green}ok{reset}");
+            // Main agent events.
+            event = rx.recv() => {
+                let Some(event) = event else { break };
+
+                if thinking {
+                    clear_thinking_line();
+                    thinking = false;
                 }
-            }
-            AgentEvent::MessageUpdate {
-                delta: StreamDelta::Text { delta },
-                ..
-            } => {
-                if !in_text {
-                    println!();
-                    in_text = true;
-                }
-                print!("{delta}");
-                io::stdout().flush().ok();
-            }
-            AgentEvent::MessageEnd {
-                message:
-                    AgentMessage::Llm(Message::Assistant {
-                        stop_reason: StopReason::Error,
-                        error_message,
-                        ..
-                    }),
-            } => {
-                if in_text {
-                    println!();
-                    in_text = false;
-                }
-                let (red, reset) = (color(RED, use_color), color(RESET, use_color));
-                let msg = error_message.as_deref().unwrap_or("unknown error");
-                tracing::error!("{msg}");
-                println!("{red}  error: {msg}{reset}");
-            }
-            AgentEvent::AgentEnd { messages } => {
-                for msg in messages.iter().rev() {
-                    if let AgentMessage::Llm(Message::Assistant { usage, .. }) = msg {
-                        last_usage = usage.clone();
-                        break;
+
+                match event {
+                    AgentEvent::ToolExecutionStart {
+                        tool_name, args, ..
+                    } => {
+                        if in_text {
+                            println!();
+                            in_text = false;
+                        }
+                        let (yellow, reset) =
+                            (color(YELLOW, use_color), color(RESET, use_color));
+                        let summary = format_tool_summary(&tool_name, &args);
+                        print!("{yellow}  > {summary}{reset}");
+                        io::stdout().flush().ok();
                     }
+                    AgentEvent::ToolExecutionEnd { is_error, .. } => {
+                        let (green, red, reset) = (
+                            color(GREEN, use_color),
+                            color(RED, use_color),
+                            color(RESET, use_color),
+                        );
+                        if is_error {
+                            println!(" {red}x{reset}");
+                        } else {
+                            println!(" {green}ok{reset}");
+                        }
+                    }
+                    AgentEvent::MessageUpdate {
+                        delta: StreamDelta::Text { delta },
+                        ..
+                    } => {
+                        if !in_text {
+                            println!();
+                            in_text = true;
+                        }
+                        print!("{delta}");
+                        io::stdout().flush().ok();
+                    }
+                    AgentEvent::MessageEnd {
+                        message:
+                            AgentMessage::Llm(Message::Assistant {
+                                stop_reason: StopReason::Error,
+                                error_message,
+                                ..
+                            }),
+                    } => {
+                        if in_text {
+                            println!();
+                            in_text = false;
+                        }
+                        let (red, reset) =
+                            (color(RED, use_color), color(RESET, use_color));
+                        let msg = error_message.as_deref().unwrap_or("unknown error");
+                        tracing::error!("{msg}");
+                        println!("{red}  error: {msg}{reset}");
+                    }
+                    AgentEvent::AgentEnd { messages } => {
+                        for msg in messages.iter().rev() {
+                            if let AgentMessage::Llm(Message::Assistant {
+                                usage, ..
+                            }) = msg
+                            {
+                                last_usage = usage.clone();
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
         }
     }
 
@@ -457,6 +548,12 @@ async fn main() -> anyhow::Result<()> {
 
     let mut model = resolve_model(&app_config, cli.model.as_deref());
     let api_key = resolve_api_key(&app_config);
+    // Only use dynamic thinking labels for Anthropic (needs a Haiku call).
+    let thinking_key: Option<&str> = if app_config.agent.default_provider != "ollama" {
+        Some(&api_key)
+    } else {
+        None
+    };
     let skills = load_skills(&cli.skills);
     tracing::debug!(%model, skills_count = skills.len(), "resolved model and skills");
 
@@ -512,7 +609,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Single-shot mode: run one prompt and exit.
     if let Some(ref prompt_text) = cli.prompt {
-        let usage = run_single_prompt(&mut agent, prompt_text, use_color).await;
+        let usage = run_single_prompt(&mut agent, prompt_text, use_color, thinking_key).await;
         print_usage(&usage, use_color);
         // Save single-shot session too.
         if let Ok(json) = agent.save_messages() {
@@ -629,7 +726,7 @@ async fn main() -> anyhow::Result<()> {
             _ => {}
         }
 
-        let usage = run_single_prompt(&mut agent, input, use_color).await;
+        let usage = run_single_prompt(&mut agent, input, use_color, thinking_key).await;
         print_usage(&usage, use_color);
         println!();
     }
