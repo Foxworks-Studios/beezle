@@ -254,8 +254,25 @@ async fn run_single_prompt(agent: &mut Agent, prompt: &str, use_color: bool) -> 
     let mut rx = agent.prompt(prompt).await;
     let mut last_usage = Usage::default();
     let mut in_text = false;
+    let mut thinking = true;
+
+    // Show a thinking indicator while waiting for the first response.
+    {
+        let (dim, reset) = (color(DIM, use_color), color(RESET, use_color));
+        let label = thinking_label();
+        print!("{dim}  {label}...{reset}");
+        io::stdout().flush().ok();
+    }
 
     while let Some(event) = rx.recv().await {
+        // Clear the thinking indicator on the first meaningful event.
+        if thinking {
+            // '\r' returns cursor to line start, then overwrite with spaces.
+            print!("\r                                \r");
+            io::stdout().flush().ok();
+            thinking = false;
+        }
+
         match event {
             AgentEvent::ToolExecutionStart {
                 tool_name, args, ..
@@ -326,6 +343,29 @@ async fn run_single_prompt(agent: &mut Agent, prompt: &str, use_color: bool) -> 
     }
 
     last_usage
+}
+
+/// Returns a random thinking-state verb for the status indicator.
+fn thinking_label() -> &'static str {
+    const LABELS: &[&str] = &[
+        "thinking",
+        "pondering",
+        "reasoning",
+        "tinkering",
+        "noodling",
+        "mulling",
+        "brewing",
+        "conjuring",
+        "scheming",
+        "hatching",
+    ];
+    // Simple fast random: use lower bits of nanosecond timestamp.
+    let idx = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as usize
+        % LABELS.len();
+    LABELS[idx]
 }
 
 /// Formats a human-readable summary of a tool invocation.
