@@ -167,13 +167,84 @@ fn resolve_model(config: &AppConfig, cli_override: Option<&str>) -> String {
 ///
 /// # Returns
 ///
+/// Wraps an `AgentTool` to print real-time execution feedback to stdout.
+///
+/// Since `agent.prompt()` awaits the full agent loop before returning events,
+/// this wrapper is the only way to show tool activity as it happens. The
+/// `execute` method prints a start line, delegates to the inner tool, then
+/// prints success/failure — all during the loop, before `prompt()` returns.
+struct ToolWrapper {
+    inner: Box<dyn AgentTool>,
+    use_color: bool,
+}
+
+#[async_trait::async_trait]
+impl AgentTool for ToolWrapper {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn label(&self) -> &str {
+        self.inner.label()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.inner.parameters_schema()
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let (yellow, green, red, reset) = (
+            color(YELLOW, self.use_color),
+            color(GREEN, self.use_color),
+            color(RED, self.use_color),
+            color(RESET, self.use_color),
+        );
+
+        // Clear any thinking indicator and show tool start.
+        clear_thinking_line();
+        let summary = format_tool_summary(self.inner.name(), &params);
+        print!("{yellow}  > {summary}{reset}");
+        io::stdout().flush().ok();
+
+        let result = self.inner.execute(params, ctx).await;
+
+        // Print result status on the same line.
+        match &result {
+            Ok(_) => println!(" {green}ok{reset}"),
+            Err(_) => println!(" {red}x{reset}"),
+        }
+
+        result
+    }
+}
+
+/// Wraps all tools in `ToolWrapper` for real-time execution feedback.
+fn wrap_tools(tools: Vec<Box<dyn AgentTool>>, use_color: bool) -> Vec<Box<dyn AgentTool>> {
+    tools
+        .into_iter()
+        .map(|inner| -> Box<dyn AgentTool> { Box::new(ToolWrapper { inner, use_color }) })
+        .collect()
+}
+
 /// A configured `Agent` ready for prompting.
+///
+/// Tools are wrapped in `ToolWrapper` to print real-time execution feedback
+/// during the agent loop (since `prompt()` doesn't return events until done).
 fn build_agent(
     config: &AppConfig,
     model: &str,
     api_key: &str,
     skills: SkillSet,
     system_prompt: &str,
+    use_color: bool,
 ) -> Agent {
     let is_ollama = config.agent.default_provider == "ollama";
     let mut agent = if is_ollama {
@@ -193,7 +264,7 @@ fn build_agent(
         .with_model(model)
         .with_api_key(api_key)
         .with_skills(skills)
-        .with_tools(default_tools());
+        .with_tools(wrap_tools(default_tools(), use_color));
 
     agent
 }
@@ -367,30 +438,9 @@ async fn render_events(
 
     while let Some(event) = rx.recv().await {
         match event {
-            AgentEvent::ToolExecutionStart {
-                tool_name, args, ..
-            } => {
-                if in_text {
-                    println!();
-                    in_text = false;
-                }
-                let (yellow, reset) = (color(YELLOW, use_color), color(RESET, use_color));
-                let summary = format_tool_summary(&tool_name, &args);
-                print!("{yellow}  > {summary}{reset}");
-                io::stdout().flush().ok();
-            }
-            AgentEvent::ToolExecutionEnd { is_error, .. } => {
-                let (green, red, reset) = (
-                    color(GREEN, use_color),
-                    color(RED, use_color),
-                    color(RESET, use_color),
-                );
-                if is_error {
-                    println!(" {red}x{reset}");
-                } else {
-                    println!(" {green}ok{reset}");
-                }
-            }
+            // ToolExecutionStart/End are handled in real time by ToolWrapper
+            // during the agent loop — skip them here to avoid duplicates.
+            AgentEvent::ToolExecutionStart { .. } | AgentEvent::ToolExecutionEnd { .. } => {}
             AgentEvent::MessageUpdate {
                 delta: StreamDelta::Text { delta },
                 ..
@@ -578,6 +628,7 @@ async fn main() -> anyhow::Result<()> {
         &api_key,
         skills.clone(),
         &system_prompt,
+        use_color,
     );
 
     // Resume a previous session if requested.
@@ -720,6 +771,7 @@ async fn main() -> anyhow::Result<()> {
                         &api_key,
                         skills.clone(),
                         &system_prompt,
+                        use_color,
                     );
                     println!("{dim}  (switched to {model}, conversation cleared){reset}\n");
                 }
