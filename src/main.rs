@@ -3,9 +3,11 @@
 //! Bootstraps configuration (with interactive onboarding on first run),
 //! parses CLI arguments, then starts the agent REPL loop.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use clap::Parser;
 
@@ -19,10 +21,7 @@ use beezle::memory::{MemoryStore, SystemClock};
 use beezle::session::SessionManager;
 use beezle::tools::memory::{MemoryReadTool, MemoryWriteTool};
 use yoagent::agent::Agent;
-use yoagent::provider::{
-    AnthropicProvider, ModelConfig, OpenAiCompatProvider, ProviderError, StreamConfig, StreamEvent,
-    StreamProvider,
-};
+use yoagent::provider::{AnthropicProvider, ModelConfig, OpenAiCompatProvider};
 use yoagent::skills::SkillSet;
 use yoagent::tools::default_tools;
 use yoagent::*;
@@ -185,254 +184,6 @@ fn resolve_model(config: &AppConfig, cli_override: Option<&str>) -> String {
 ///
 /// # Returns
 ///
-/// Wraps a `StreamProvider` to print LLM text deltas to stdout in real time.
-///
-/// Intercepts the `tx` channel passed to `stream()`, spawns a forwarding task
-/// that prints `TextDelta` events as they arrive, then passes them through to
-/// the original channel so the agent loop still processes them normally.
-struct StreamProviderWrapper {
-    inner: Box<dyn StreamProvider>,
-}
-
-#[async_trait::async_trait]
-impl StreamProvider for StreamProviderWrapper {
-    async fn stream(
-        &self,
-        config: StreamConfig,
-        tx: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
-        cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<Message, ProviderError> {
-        // Create an intercepting channel: provider sends to our tx,
-        // we forward to the original tx while printing text deltas.
-        let (intercept_tx, mut intercept_rx) =
-            tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
-
-        let original_tx = tx;
-
-        // Spawn a forwarder that prints text deltas and passes everything through.
-        let forwarder = tokio::spawn(async move {
-            let mut in_text = false;
-            while let Some(event) = intercept_rx.recv().await {
-                if let StreamEvent::TextDelta { ref delta, .. } = event {
-                    if !in_text {
-                        // Clear thinking indicator on first text.
-                        clear_thinking_line();
-                        println!();
-                        in_text = true;
-                    }
-                    print!("{delta}");
-                    io::stdout().flush().ok();
-                }
-                // Forward all events to the original channel.
-                let _ = original_tx.send(event);
-            }
-            if in_text {
-                println!();
-            }
-            // Signal whether we printed text (so render_events can skip it).
-            in_text
-        });
-
-        // Run the real provider with our intercepting channel.
-        let result = self.inner.stream(config, intercept_tx, cancel).await;
-
-        // Wait for forwarder to finish draining.
-        let _ = forwarder.await;
-
-        result
-    }
-}
-
-/// Wraps an `AgentTool` to print real-time execution feedback to stdout.
-///
-/// Since `agent.prompt()` awaits the full agent loop before returning events,
-/// this wrapper is the only way to show tool activity as it happens. The
-/// `execute` method prints a start line, delegates to the inner tool, then
-/// prints success/failure — all during the loop, before `prompt()` returns.
-struct ToolWrapper {
-    inner: Box<dyn AgentTool>,
-    use_color: bool,
-}
-
-#[async_trait::async_trait]
-impl AgentTool for ToolWrapper {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    fn label(&self) -> &str {
-        self.inner.label()
-    }
-
-    fn description(&self) -> &str {
-        self.inner.description()
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        self.inner.parameters_schema()
-    }
-
-    async fn execute(
-        &self,
-        params: serde_json::Value,
-        ctx: ToolContext,
-    ) -> Result<ToolResult, ToolError> {
-        let (yellow, green, red, reset) = (
-            color(YELLOW, self.use_color),
-            color(GREEN, self.use_color),
-            color(RED, self.use_color),
-            color(RESET, self.use_color),
-        );
-
-        // Clear any thinking indicator and show tool start.
-        clear_thinking_line();
-        let summary = format_tool_summary(self.inner.name(), &params);
-        print!("{yellow}  > {summary}{reset}");
-        io::stdout().flush().ok();
-
-        let result = self.inner.execute(params, ctx).await;
-
-        // Print result status on the same line.
-        match &result {
-            Ok(_) => println!(" {green}ok{reset}"),
-            Err(_) => println!(" {red}x{reset}"),
-        }
-
-        result
-    }
-}
-
-/// Wraps tools in `ToolWrapper` for real-time execution feedback.
-///
-/// All tools are wrapped uniformly. Sub-agent tools should be wrapped
-/// separately with [`SubAgentWrapper`] before being added to the list.
-fn wrap_tools(tools: Vec<Box<dyn AgentTool>>, use_color: bool) -> Vec<Box<dyn AgentTool>> {
-    tools
-        .into_iter()
-        .map(|inner| -> Box<dyn AgentTool> { Box::new(ToolWrapper { inner, use_color }) })
-        .collect()
-}
-
-/// Wraps a sub-agent tool to display real-time progress in the terminal.
-///
-/// Unlike [`ToolWrapper`] which just prints start/end lines, this wrapper
-/// intercepts the sub-agent's `on_update` events and prints intermediate
-/// progress (tool calls, text deltas) in dim text with a `[sub]` prefix.
-/// Progress output is ephemeral -- printed to stdout but not stored in
-/// the parent's context.
-struct SubAgentWrapper {
-    inner: Box<dyn AgentTool>,
-    use_color: bool,
-}
-
-#[async_trait::async_trait]
-impl AgentTool for SubAgentWrapper {
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    fn label(&self) -> &str {
-        self.inner.label()
-    }
-
-    fn description(&self) -> &str {
-        self.inner.description()
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        self.inner.parameters_schema()
-    }
-
-    async fn execute(
-        &self,
-        params: serde_json::Value,
-        ctx: ToolContext,
-    ) -> Result<ToolResult, ToolError> {
-        let use_color = self.use_color;
-        let (yellow, green, red, dim, reset) = (
-            color(YELLOW, use_color),
-            color(GREEN, use_color),
-            color(RED, use_color),
-            color(DIM, use_color),
-            color(RESET, use_color),
-        );
-
-        // Print the tool start line (same pattern as ToolWrapper).
-        clear_thinking_line();
-        let task_preview = params.get("task").and_then(|v| v.as_str()).unwrap_or("...");
-        print!(
-            "{yellow}  > spawn_agent: {}{reset}",
-            truncate(task_preview, 60)
-        );
-        io::stdout().flush().ok();
-        println!();
-
-        // Create an on_update callback that prints sub-agent progress in dim text.
-        let parent_on_update = ctx.on_update.clone();
-        let progress_update: ToolUpdateFn = Arc::new(move |result: ToolResult| {
-            // Extract text content for display.
-            for content in &result.content {
-                if let Content::Text { text } = content {
-                    // Detect tool call notifications vs text deltas.
-                    if text.starts_with("[sub-agent calling tool:") {
-                        // Extract tool name from the notification.
-                        let tool_info = text
-                            .trim_start_matches("[sub-agent calling tool: ")
-                            .trim_end_matches(']');
-                        println!(
-                            "{dim}    [sub] > {tool_info}{reset}",
-                            dim = color(DIM, use_color),
-                            reset = color(RESET, use_color),
-                        );
-                    }
-                    // Text deltas are intentionally not printed line-by-line
-                    // to avoid flooding the terminal. The final result is
-                    // printed by the parent.
-                }
-            }
-
-            // Forward to parent's on_update if present.
-            if let Some(ref parent) = parent_on_update {
-                parent(result);
-            }
-        });
-
-        // Create an on_progress callback that prints progress messages.
-        let parent_on_progress = ctx.on_progress.clone();
-        let progress_fn: ProgressFn = Arc::new(move |text: String| {
-            println!(
-                "{dim}    [sub] {text}{reset}",
-                dim = color(DIM, use_color),
-                reset = color(RESET, use_color),
-            );
-
-            // Forward to parent's on_progress if present.
-            if let Some(ref parent) = parent_on_progress {
-                parent(text);
-            }
-        });
-
-        // Build a modified context with our progress callbacks.
-        let sub_ctx = ToolContext {
-            tool_call_id: ctx.tool_call_id,
-            tool_name: ctx.tool_name,
-            cancel: ctx.cancel,
-            on_update: Some(progress_update),
-            on_progress: Some(progress_fn),
-        };
-
-        let result = self.inner.execute(params, sub_ctx).await;
-
-        // Print result status.
-        match &result {
-            Ok(_) => println!("{dim}    [sub] {green}done{reset}"),
-            Err(_) => println!("{dim}    [sub] {red}failed{reset}"),
-        }
-
-        result
-    }
-}
-
 /// Loads a [`MemoryStore`] rooted at `~/.beezle/memory/`.
 ///
 /// Returns `None` if the home directory cannot be determined (logs a warning).
@@ -459,42 +210,32 @@ fn load_memory_store() -> Option<Arc<MemoryStore>> {
 
 /// A configured `Agent` ready for prompting.
 ///
-/// Tools are wrapped in `ToolWrapper` to print real-time execution feedback
-/// during the agent loop (since `prompt()` doesn't return events until done).
+/// Assembles the provider, tools (default + subagent + memory), skills, and
+/// system prompt into a fully wired `Agent`. Tools are passed unwrapped --
+/// all rendering happens in `run_prompt()`'s event-driven loop.
 fn build_agent(
     config: &AppConfig,
     model: &str,
     api_key: &str,
     skills: SkillSet,
     system_prompt: &str,
-    use_color: bool,
     memory_store: Option<Arc<MemoryStore>>,
 ) -> Agent {
     let is_ollama = config.agent.default_provider == "ollama";
 
-    let (provider, model_cfg): (Box<dyn StreamProvider>, Option<ModelConfig>) = if is_ollama {
+    let mut agent = if is_ollama {
         let base_url = config
             .providers
             .ollama
             .as_ref()
             .map(|o| o.base_url.as_str())
             .unwrap_or("http://localhost:11434");
-        (
-            Box::new(OpenAiCompatProvider),
-            Some(ModelConfig::local(base_url, model)),
-        )
+        Agent::new(OpenAiCompatProvider).with_model_config(ModelConfig::local(base_url, model))
     } else {
-        (Box::new(AnthropicProvider), None)
+        Agent::new(AnthropicProvider)
     };
 
-    let wrapped_provider = StreamProviderWrapper { inner: provider };
-
-    let mut agent = Agent::new(wrapped_provider);
-    if let Some(cfg) = model_cfg {
-        agent = agent.with_model_config(cfg);
-    }
-
-    // Build the sub-agent tool (unwrapped -- it manages its own output).
+    // Build the sub-agent tool.
     let subagent = build_subagent(
         "spawn_agent",
         "Spawn a sub-agent to handle a focused task independently. \
@@ -506,24 +247,13 @@ fn build_agent(
         api_key,
     );
 
-    // Wrap default tools for real-time feedback, then append the sub-agent
-    // tool wrapped in SubAgentWrapper for progress display.
-    let mut tools = wrap_tools(default_tools(), use_color);
-    tools.push(Box::new(SubAgentWrapper {
-        inner: Box::new(subagent),
-        use_color,
-    }));
+    let mut tools: Vec<Box<dyn AgentTool>> = default_tools();
+    tools.push(Box::new(subagent));
 
     // Register memory tools when a MemoryStore is available.
     if let Some(store) = memory_store {
-        tools.push(Box::new(ToolWrapper {
-            inner: Box::new(MemoryReadTool::new(Arc::clone(&store))),
-            use_color,
-        }));
-        tools.push(Box::new(ToolWrapper {
-            inner: Box::new(MemoryWriteTool::new(store)),
-            use_color,
-        }));
+        tools.push(Box::new(MemoryReadTool::new(Arc::clone(&store))));
+        tools.push(Box::new(MemoryWriteTool::new(store)));
     }
 
     agent = agent
@@ -577,165 +307,97 @@ fn load_skills(cli_dirs: &[PathBuf]) -> SkillSet {
     })
 }
 
-/// Fetches a contextual thinking label by asking a fast model to generate
-/// a whimsical gerund related to the user's message.
+/// Runs a prompt through the agent using an event-driven loop.
 ///
-/// Returns `None` if the call fails or produces empty output.
-///
-/// # Arguments
-///
-/// * `api_key` - Anthropic API key or OAuth token.
-/// * `user_prompt` - The user's message to derive the label from.
-async fn fetch_thinking_label(api_key: &str, user_prompt: &str) -> Option<String> {
-    let system = "\
-Analyze this message and come up with a single positive, cheerful and delightful \
-verb in gerund form that's related to the message. Only include the word with no \
-other text or punctuation. The word should have the first letter capitalized. Add \
-some whimsy and surprise to entertain the user. Ensure the word is highly relevant \
-to the user's message. Synonyms are welcome, including obscure words. Be careful \
-to avoid words that might look alarming or concerning to the software engineer \
-seeing it as a status notification, such as Connecting, Disconnecting, Retrying, \
-Lagging, Freezing, etc. NEVER use a destructive word, such as Terminating, \
-Killing, Deleting, Destroying, Stopping, Exiting, or similar. NEVER use a word \
-that may be derogatory, offensive, or inappropriate in a non-coding context, \
-such as Penetrating.";
-
-    let mut agent = Agent::new(AnthropicProvider)
-        .with_model("claude-haiku-4-5-20251001")
-        .with_api_key(api_key)
-        .with_system_prompt(system);
-
-    let mut rx = agent.prompt(user_prompt).await;
-    let mut result = String::new();
-
-    while let Some(event) = rx.recv().await {
-        if let AgentEvent::MessageUpdate {
-            delta: StreamDelta::Text { delta },
-            ..
-        } = event
-        {
-            result.push_str(&delta);
-        }
-    }
-
-    let label = result.trim().to_owned();
-    if label.is_empty() { None } else { Some(label) }
-}
-
-/// Clears the current thinking indicator line.
-fn clear_thinking_line() {
-    print!("\r                                        \r");
-    io::stdout().flush().ok();
-}
-
-/// Runs a single prompt through the agent and prints the response.
-///
-/// Shows a thinking indicator while waiting for the agent loop to complete.
-///
-/// **Note:** `agent.prompt()` awaits the entire agent loop internally before
-/// returning the event receiver. Events are buffered, not truly streamed to
-/// us in real time. The thinking indicator covers this wait. Once we have
-/// the receiver, we drain events immediately.
+/// Spawns the agent loop on a background task via `agent.prompt()`, then
+/// processes streamed `AgentEvent`s in real time. Supports Ctrl+C cancellation
+/// via `agent.abort()`. After the loop, `agent.finish()` restores agent state.
 ///
 /// # Arguments
 ///
 /// * `agent` - The agent to prompt.
 /// * `prompt` - The user's prompt text.
 /// * `use_color` - Whether to use ANSI color output.
-/// * `thinking_api_key` - If `Some`, uses Haiku to generate a contextual
-///   thinking label. Falls back to a random static label if `None` or on error.
 ///
 /// # Returns
 ///
 /// The final token usage from the turn.
-async fn run_single_prompt(
-    agent: &mut Agent,
-    prompt: &str,
-    use_color: bool,
-    thinking_api_key: Option<&str>,
-) -> Usage {
-    let (dim, reset_code) = (color(DIM, use_color), color(RESET, use_color));
-
-    // Show thinking indicator immediately so the user sees feedback while
-    // agent.prompt() runs the entire agent loop internally.
-    let static_label = thinking_label();
-    print!("{dim}  {static_label}...{reset_code}");
-    io::stdout().flush().ok();
-
-    // Optionally fire a Haiku call in parallel for a contextual label.
-    // It races against agent.prompt() — whichever finishes first wins.
-    let label_task = thinking_api_key.map(|key| {
-        let key = key.to_owned();
-        let msg = prompt.to_owned();
-        tokio::spawn(async move { fetch_thinking_label(&key, &msg).await })
-    });
-
-    // agent.prompt() awaits the full agent loop — all events are buffered
-    // in the unbounded channel by the time it returns.
-    let rx = agent.prompt(prompt).await;
-
-    // Clear the thinking indicator now that the loop is done.
-    clear_thinking_line();
-
-    // Abort the label task if it's still running — we no longer need it.
-    if let Some(handle) = label_task {
-        handle.abort();
-    }
-
-    // Drain buffered events and render output.
-    render_events(rx, use_color).await
-}
-
-/// Drains agent events from the receiver and renders them to stdout.
-///
-/// # Arguments
-///
-/// * `rx` - The event receiver (events are already buffered).
-/// * `use_color` - Whether to use ANSI color output.
-///
-/// # Returns
-///
-/// The final token usage from the turn.
-async fn render_events(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
-    use_color: bool,
-) -> Usage {
+async fn run_prompt(agent: &mut Agent, prompt: &str, use_color: bool) -> Usage {
+    let mut rx = agent.prompt(prompt).await;
     let mut last_usage = Usage::default();
+    let mut tool_starts: HashMap<String, Instant> = HashMap::new();
 
-    while let Some(event) = rx.recv().await {
-        match event {
-            // Tool and text streaming events are handled in real time by
-            // ToolWrapper and StreamProviderWrapper — skip to avoid duplicates.
-            AgentEvent::ToolExecutionStart { .. }
-            | AgentEvent::ToolExecutionEnd { .. }
-            | AgentEvent::MessageUpdate {
-                delta: StreamDelta::Text { .. },
-                ..
-            } => {}
-            AgentEvent::MessageEnd {
-                message:
-                    AgentMessage::Llm(Message::Assistant {
-                        stop_reason: StopReason::Error,
-                        error_message,
-                        ..
-                    }),
-            } => {
-                let (red, reset) = (color(RED, use_color), color(RESET, use_color));
-                let msg = error_message.as_deref().unwrap_or("unknown error");
-                tracing::error!("{msg}");
-                println!("{red}  error: {msg}{reset}");
-            }
-            AgentEvent::AgentEnd { messages } => {
-                for msg in messages.iter().rev() {
-                    if let AgentMessage::Llm(Message::Assistant { usage, .. }) = msg {
-                        last_usage = usage.clone();
-                        break;
+    let (yellow, green, red, dim, reset) = (
+        color(YELLOW, use_color),
+        color(GREEN, use_color),
+        color(RED, use_color),
+        color(DIM, use_color),
+        color(RESET, use_color),
+    );
+
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                let Some(event) = event else { break };
+                match event {
+                    AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args, .. } => {
+                        tool_starts.insert(tool_call_id.clone(), Instant::now());
+                        let summary = format_tool_summary(&tool_name, &args);
+                        print!("{yellow}  > {summary}{reset}");
+                        io::stdout().flush().ok();
                     }
+                    AgentEvent::ToolExecutionEnd { tool_call_id, is_error, .. } => {
+                        let elapsed = tool_starts.remove(&tool_call_id)
+                            .map(|t| t.elapsed());
+                        let duration = elapsed
+                            .map(|d| format!(" ({:.1}s)", d.as_secs_f64()))
+                            .unwrap_or_default();
+                        if is_error {
+                            println!(" {red}x{duration}{reset}");
+                        } else {
+                            println!(" {green}ok{duration}{reset}");
+                        }
+                    }
+                    AgentEvent::MessageUpdate { delta: StreamDelta::Text { delta }, .. } => {
+                        print!("{delta}");
+                        io::stdout().flush().ok();
+                    }
+                    AgentEvent::MessageUpdate { delta: StreamDelta::Thinking { delta }, .. } => {
+                        print!("{dim}{delta}{reset}");
+                        io::stdout().flush().ok();
+                    }
+                    AgentEvent::MessageEnd { message: AgentMessage::Llm(Message::Assistant {
+                        stop_reason: StopReason::Error, error_message, ..
+                    }) } => {
+                        let msg = error_message.as_deref().unwrap_or("unknown error");
+                        tracing::error!("{msg}");
+                        println!("{red}  error: {msg}{reset}");
+                    }
+                    AgentEvent::AgentEnd { messages } => {
+                        for msg in messages.iter().rev() {
+                            if let AgentMessage::Llm(Message::Assistant { usage, .. }) = msg {
+                                last_usage = usage.clone();
+                                break;
+                            }
+                        }
+                    }
+                    AgentEvent::ProgressMessage { text, .. } => {
+                        println!("{dim}  {text}{reset}");
+                    }
+                    AgentEvent::InputRejected { reason } => {
+                        println!("{red}  rejected: {reason}{reset}");
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
+            _ = tokio::signal::ctrl_c() => {
+                agent.abort();
+                break;
+            }
         }
     }
+
+    agent.finish().await;
 
     last_usage
 }
@@ -776,29 +438,6 @@ fn build_effective_system_prompt(base: &str, memory_content: &str) -> String {
     };
 
     format!("{base}\n\n## Persistent Memory\n{truncated}")
-}
-
-/// Returns a random thinking-state verb for the status indicator.
-fn thinking_label() -> &'static str {
-    const LABELS: &[&str] = &[
-        "thinking",
-        "pondering",
-        "reasoning",
-        "tinkering",
-        "noodling",
-        "mulling",
-        "brewing",
-        "conjuring",
-        "scheming",
-        "hatching",
-    ];
-    // Simple fast random: use lower bits of nanosecond timestamp.
-    let idx = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as usize
-        % LABELS.len();
-    LABELS[idx]
 }
 
 /// Formats a human-readable summary of a tool invocation.
@@ -869,7 +508,6 @@ fn handle_slash_command(
     skills: &SkillSet,
     system_prompt: &str,
     session_mgr: &SessionManager,
-    use_color: bool,
     dim: &str,
     reset: &str,
 ) -> SlashResult {
@@ -925,7 +563,6 @@ fn handle_slash_command(
                     api_key,
                     skills.clone(),
                     system_prompt,
-                    use_color,
                     None,
                 );
                 format!("{dim}  (switched to {model}, conversation cleared){reset}\n")
@@ -982,12 +619,6 @@ async fn main() -> anyhow::Result<()> {
 
     let mut model = resolve_model(&app_config, cli.model.as_deref());
     let api_key = resolve_api_key(&app_config);
-    // Only use dynamic thinking labels for Anthropic (needs a Haiku call).
-    let thinking_key: Option<&str> = if app_config.agent.default_provider != "ollama" {
-        Some(&api_key)
-    } else {
-        None
-    };
     let skills = load_skills(&cli.skills);
     tracing::debug!(%model, skills_count = skills.len(), "resolved model and skills");
 
@@ -1024,7 +655,6 @@ async fn main() -> anyhow::Result<()> {
         &api_key,
         skills.clone(),
         &system_prompt,
-        use_color,
         memory_store,
     );
 
@@ -1059,7 +689,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Single-shot mode: run one prompt and exit.
     if let Some(ref prompt_text) = cli.prompt {
-        let usage = run_single_prompt(&mut agent, prompt_text, use_color, thinking_key).await;
+        let usage = run_prompt(&mut agent, prompt_text, use_color).await;
         print_usage(&usage, use_color);
         // Save single-shot session too.
         if let Ok(json) = agent.save_messages() {
@@ -1067,15 +697,6 @@ async fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
-
-    // Graceful Ctrl+C exit.
-    let color_flag = use_color;
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        let (dim, reset) = (color(DIM, color_flag), color(RESET, color_flag));
-        println!("\n{dim}  bye{reset}\n");
-        std::process::exit(0);
-    });
 
     print_banner(use_color);
     let (dim, reset) = (color(DIM, use_color), color(RESET, use_color));
@@ -1114,7 +735,6 @@ async fn main() -> anyhow::Result<()> {
             &skills,
             &system_prompt,
             &session_mgr,
-            use_color,
             dim,
             reset,
         );
@@ -1132,7 +752,7 @@ async fn main() -> anyhow::Result<()> {
             }
             SlashResult::NotSlash => {
                 // Regular prompt — send to agent, respond via oneshot.
-                let usage = run_single_prompt(&mut agent, &input, use_color, thinking_key).await;
+                let usage = run_prompt(&mut agent, &input, use_color).await;
                 print_usage(&usage, use_color);
                 println!();
 
@@ -1204,7 +824,6 @@ mod tests {
             &skills,
             "test prompt",
             session_mgr,
-            false,
             "",
             "",
         );
@@ -1564,86 +1183,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // render_events tests
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn render_events_returns_usage_from_agent_end() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-        // Simulate a minimal agent event sequence with usage data.
-        tx.send(AgentEvent::AgentEnd {
-            messages: vec![AgentMessage::Llm(Message::Assistant {
-                content: vec![Content::Text {
-                    text: "hello".into(),
-                }],
-                stop_reason: StopReason::Stop,
-                model: "mock".into(),
-                provider: "mock".into(),
-                usage: Usage {
-                    input: 100,
-                    output: 50,
-                    ..Usage::default()
-                },
-                timestamp: 0,
-                error_message: None,
-            })],
-        })
-        .unwrap();
-        drop(tx);
-
-        let usage = render_events(rx, false).await;
-        assert_eq!(usage.input, 100);
-        assert_eq!(usage.output, 50);
-    }
-
-    #[tokio::test]
-    async fn render_events_returns_default_usage_when_no_events() {
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        drop(_tx);
-
-        let usage = render_events(rx, false).await;
-        assert_eq!(usage.input, 0);
-        assert_eq!(usage.output, 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // run_single_prompt integration tests (using MockProvider)
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn run_single_prompt_returns_usage() {
-        let mut agent = mock_agent("Hello from mock!");
-
-        // No thinking key (skip Haiku label call), no color.
-        let usage = run_single_prompt(&mut agent, "Hi", false, None).await;
-
-        // MockProvider returns default usage (zeros), but the function
-        // should complete without error.
-        assert_eq!(usage.input, 0);
-        assert_eq!(usage.output, 0);
-
-        // Agent should have accumulated user + assistant messages.
-        assert_eq!(agent.messages().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn run_single_prompt_multiple_turns() {
-        // MockProvider with two responses for two sequential prompts.
-        let provider = MockProvider::texts(vec!["First", "Second"]);
-        let mut agent = Agent::new(provider)
-            .with_system_prompt("test")
-            .with_model("mock")
-            .with_api_key("test-key");
-
-        let _ = run_single_prompt(&mut agent, "msg1", false, None).await;
-        assert_eq!(agent.messages().len(), 2);
-
-        let _ = run_single_prompt(&mut agent, "msg2", false, None).await;
-        assert_eq!(agent.messages().len(), 4);
-    }
-
-    // -----------------------------------------------------------------------
     // Bus consumer integration tests
     // -----------------------------------------------------------------------
 
@@ -1683,7 +1222,6 @@ mod tests {
             &skills,
             "test",
             &session_mgr,
-            false,
             dim,
             reset,
         );
@@ -1716,7 +1254,7 @@ mod tests {
 
         // Simulate the consumer: it's not a slash command, so run agent.
         let mut agent = mock_agent("agent response");
-        let _usage = run_single_prompt(&mut agent, &cmd.content, false, None).await;
+        let _usage = run_prompt(&mut agent, &cmd.content, false).await;
 
         // Send empty response (output was streamed).
         cmd.response_tx
@@ -1734,56 +1272,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // wrap_tools + spawn_agent tests
+    // build_agent_tools_include_spawn_agent
     // -----------------------------------------------------------------------
 
     #[test]
-    fn wrap_tools_skips_spawn_agent() {
-        use std::sync::Arc;
-        use yoagent::sub_agent::SubAgentTool;
-
-        let provider: Arc<dyn StreamProvider> = Arc::new(MockProvider::text("mock"));
-        let spawn_tool: Box<dyn AgentTool> = Box::new(
-            SubAgentTool::new("spawn_agent", provider)
-                .with_description("test")
-                .with_system_prompt("test")
-                .with_model("mock")
-                .with_api_key("key"),
-        );
-
-        // A regular tool plus the spawn_agent tool.
-        let mut tools: Vec<Box<dyn AgentTool>> = default_tools();
-        let regular_count = tools.len();
-        tools.push(spawn_tool);
-
-        let wrapped = wrap_tools(tools, false);
-
-        // Total count should be regular + 1 (spawn_agent).
-        assert_eq!(wrapped.len(), regular_count + 1);
-
-        // The spawn_agent tool should still be named "spawn_agent" and NOT be
-        // wrapped in ToolWrapper (ToolWrapper delegates name() so we can't
-        // distinguish by name alone -- instead we verify the count is correct
-        // and that a tool named spawn_agent exists).
-        let has_spawn = wrapped.iter().any(|t| t.name() == "spawn_agent");
-        assert!(has_spawn, "spawn_agent should be in the wrapped tools list");
-    }
-
-    #[test]
-    fn wrap_tools_still_wraps_regular_tools() {
-        // Ensure regular tools are still wrapped (they produce output on execute).
-        let tools = default_tools();
-        let count = tools.len();
-        let wrapped = wrap_tools(tools, false);
-        assert_eq!(wrapped.len(), count);
-        // All regular tools should still be present by name.
-        assert!(wrapped.iter().any(|t| t.name() == "bash"));
-    }
-
-    #[test]
     fn build_agent_tools_include_spawn_agent() {
-        // Simulate what build_agent does: combine wrapped default_tools with
-        // the unwrapped spawn_agent tool. Verify spawn_agent is present.
+        // Verify that default_tools() plus the unwrapped subagent tool
+        // yields a list containing "spawn_agent".
         use beezle::agent::build_subagent;
 
         let config = AppConfig::default();
@@ -1796,11 +1291,8 @@ mod tests {
             "test-key",
         );
 
-        let mut tools = wrap_tools(default_tools(), false);
-        tools.push(Box::new(SubAgentWrapper {
-            inner: Box::new(subagent),
-            use_color: false,
-        }));
+        let mut tools: Vec<Box<dyn AgentTool>> = default_tools();
+        tools.push(Box::new(subagent));
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(
@@ -1809,87 +1301,6 @@ mod tests {
         );
         // spawn_agent should be in addition to default tools.
         assert!(tools.len() > default_tools().len());
-    }
-
-    // -----------------------------------------------------------------------
-    // SubAgentWrapper tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn subagent_wrapper_delegates_name() {
-        use std::sync::Arc;
-        use yoagent::sub_agent::SubAgentTool;
-
-        let provider: Arc<dyn StreamProvider> = Arc::new(MockProvider::text("mock"));
-        let tool = SubAgentTool::new("spawn_agent", provider)
-            .with_description("test desc")
-            .with_system_prompt("test")
-            .with_model("mock")
-            .with_api_key("key");
-
-        let wrapper = SubAgentWrapper {
-            inner: Box::new(tool),
-            use_color: false,
-        };
-
-        assert_eq!(wrapper.name(), "spawn_agent");
-        assert_eq!(wrapper.description(), "test desc");
-    }
-
-    #[tokio::test]
-    async fn subagent_wrapper_on_update_receives_events() {
-        // Verify that executing a sub-agent through SubAgentWrapper causes
-        // on_update callbacks to fire with expected progress events.
-        use std::sync::{Arc, Mutex};
-        use yoagent::sub_agent::SubAgentTool;
-
-        let provider: Arc<dyn StreamProvider> = Arc::new(MockProvider::text("Sub result"));
-        let tool = SubAgentTool::new("spawn_agent", provider)
-            .with_description("test")
-            .with_system_prompt("test")
-            .with_model("mock")
-            .with_api_key("key");
-
-        let wrapper = SubAgentWrapper {
-            inner: Box::new(tool),
-            use_color: false,
-        };
-
-        // Collect on_update events via a shared vec (std::sync::Mutex is safe
-        // here because the callback is synchronous Fn, not async).
-        let updates: Arc<Mutex<Vec<ToolResult>>> = Arc::new(Mutex::new(Vec::new()));
-        let updates_clone = updates.clone();
-        let on_update: ToolUpdateFn = Arc::new(move |result: ToolResult| {
-            updates_clone.lock().unwrap().push(result);
-        });
-
-        let ctx = ToolContext {
-            tool_call_id: "tc-test".into(),
-            tool_name: "spawn_agent".into(),
-            cancel: tokio_util::sync::CancellationToken::new(),
-            on_update: Some(on_update),
-            on_progress: None,
-        };
-
-        let params = serde_json::json!({"task": "Say hello"});
-        let result = wrapper.execute(params, ctx).await;
-
-        assert!(result.is_ok(), "SubAgentWrapper execution should succeed");
-        let result = result.unwrap();
-        // The final result should contain the sub-agent's output.
-        let text = match &result.content[0] {
-            Content::Text { text } => text.as_str(),
-            other => panic!("Expected Text content, got: {:?}", other),
-        };
-        assert_eq!(text, "Sub result");
-
-        // The on_update callback should have received at least one event
-        // (the text delta from the sub-agent's response).
-        let collected = updates.lock().unwrap();
-        assert!(
-            !collected.is_empty(),
-            "on_update should have received at least one event"
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -1929,51 +1340,64 @@ mod tests {
         assert!(content.len() <= 4000 + "[truncated]".len());
     }
 
-    #[tokio::test]
-    async fn subagent_wrapper_progress_events_contain_text_deltas() {
-        // Verify that progress events include text delta content from
-        // the sub-agent's response stream.
-        use std::sync::{Arc, Mutex};
-        use yoagent::sub_agent::SubAgentTool;
+    // -----------------------------------------------------------------------
+    // run_prompt tests (TDD red step -- run_prompt does not exist yet)
+    //
+    // These tests target the future `run_prompt()` function specified in
+    // PRD 011. They will fail to compile until `run_prompt` is implemented.
+    // -----------------------------------------------------------------------
 
-        let provider: Arc<dyn StreamProvider> = Arc::new(MockProvider::text("Hello from sub"));
-        let tool = SubAgentTool::new("spawn_agent", provider)
-            .with_description("test")
+    #[tokio::test]
+    async fn run_prompt_returns_usage_from_agent_end() {
+        let mut agent = mock_agent("hello");
+
+        // run_prompt will replace run_single_prompt with a streamlined
+        // event-driven loop. MockProvider returns zero usage by default.
+        let usage = run_prompt(&mut agent, "hi", false).await;
+
+        assert_eq!(usage.input, 0);
+        assert_eq!(usage.output, 0);
+        // Agent should accumulate user + assistant messages.
+        assert_eq!(agent.messages().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn run_prompt_accumulates_usage_across_turns() {
+        let provider = MockProvider::texts(vec!["First", "Second"]);
+        let mut agent = Agent::new(provider)
             .with_system_prompt("test")
             .with_model("mock")
-            .with_api_key("key");
+            .with_api_key("test-key");
 
-        let wrapper = SubAgentWrapper {
-            inner: Box::new(tool),
-            use_color: false,
-        };
+        let _ = run_prompt(&mut agent, "msg1", false).await;
+        assert_eq!(agent.messages().len(), 2);
 
-        let updates: Arc<Mutex<Vec<ToolResult>>> = Arc::new(Mutex::new(Vec::new()));
-        let updates_clone = updates.clone();
-        let on_update: ToolUpdateFn = Arc::new(move |result: ToolResult| {
-            updates_clone.lock().unwrap().push(result);
-        });
+        let _ = run_prompt(&mut agent, "msg2", false).await;
+        assert_eq!(agent.messages().len(), 4);
+    }
 
-        let ctx = ToolContext {
-            tool_call_id: "tc-test".into(),
-            tool_name: "spawn_agent".into(),
-            cancel: tokio_util::sync::CancellationToken::new(),
-            on_update: Some(on_update),
-            on_progress: None,
-        };
+    #[tokio::test]
+    async fn run_prompt_processes_tool_execution_events_without_panic() {
+        use yoagent::provider::mock::{MockResponse, MockToolCall};
+        use yoagent::tools::default_tools;
 
-        let params = serde_json::json!({"task": "Say hello"});
-        let _ = wrapper.execute(params, ctx).await.unwrap();
+        // Set up a mock provider that first requests a tool call (bash echo),
+        // then produces a final text response. The agent loop will emit
+        // ToolExecutionStart and ToolExecutionEnd events for the tool call.
+        let provider = MockProvider::new(vec![
+            MockResponse::ToolCalls(vec![MockToolCall {
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "echo ok"}),
+            }]),
+            MockResponse::Text("Done.".into()),
+        ]);
+        let mut agent = Agent::new(provider)
+            .with_system_prompt("test")
+            .with_model("mock")
+            .with_api_key("test-key")
+            .with_tools(default_tools());
 
-        let collected = updates.lock().unwrap();
-        // Check that at least one update contains text content.
-        let has_text = collected
-            .iter()
-            .any(|r| r.content.iter().any(|c| matches!(c, Content::Text { .. })));
-        assert!(
-            has_text,
-            "progress events should include text content, got: {:?}",
-            *collected
-        );
+        // Should process tool execution events and return without panicking.
+        let _usage = run_prompt(&mut agent, "run a command", false).await;
     }
 }
