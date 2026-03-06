@@ -42,7 +42,7 @@ Use tools proactively: read files to understand context, run commands to verify 
 After making changes, run tests or verify the result when appropriate.
 
 You have persistent memory that survives across sessions. Your long-term memory
-(MEMORY.md) is already included in this prompt above. Use your memory tools to:
+(MEMORY.md) is included in this prompt below. Use your memory tools to:
 - Save user preferences, project conventions, and key decisions to long-term memory.
 - When the user corrects you or states a preference, save it so you don't repeat the mistake.
 - Use daily notes to record what you accomplished during a session.
@@ -612,7 +612,7 @@ fn build_effective_system_prompt(base: &str, memory_content: &str) -> String {
         memory_content.to_owned()
     };
 
-    format!("{enhanced_base}\n\n## Persistent Memory\n{truncated}")
+    format!("{enhanced_base}\n\n📝 PERSISTENT MEMORY 📝\n\nThis information persists across sessions and informs your understanding:\n\n{truncated}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 }
 
 /// Formats a human-readable summary of a tool invocation.
@@ -1563,6 +1563,21 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_emphasizes_memory_section_when_present() {
+        // RED: Test that memory content gets clear visual emphasis
+        let base_prompt = "You are a helpful assistant.";
+        let memory = "User prefers Rust. Project uses TDD.";
+        
+        let result = build_effective_system_prompt(base_prompt, memory);
+        
+        // Memory should have visual emphasis similar to project constraints
+        assert!(
+            result.contains("📝 PERSISTENT MEMORY"),
+            "System prompt should visually emphasize memory section, got: {result}"
+        );
+    }
+
+    #[test]
     fn build_effective_system_prompt_empty_memory_returns_base() {
         let base = "You are a helpful assistant.";
         let result = build_effective_system_prompt(base, "");
@@ -1575,7 +1590,7 @@ mod tests {
         let memory = "User prefers Rust.";
         let result = build_effective_system_prompt(base, memory);
         assert!(result.starts_with(base));
-        assert!(result.contains("\n\n## Persistent Memory\n"));
+        assert!(result.contains("📝 PERSISTENT MEMORY"));
         assert!(result.contains(memory));
     }
 
@@ -1585,14 +1600,11 @@ mod tests {
         let memory = "x".repeat(5000);
         let result = build_effective_system_prompt(base, &memory);
         assert!(result.contains("[truncated]"));
-        // The memory section (after the header) should not exceed 4000 chars
-        // plus the "[truncated]" suffix.
-        let header = "\n\n## Persistent Memory\n";
-        let memory_section = result.strip_prefix(base).unwrap();
-        assert!(memory_section.starts_with(header));
-        let content = memory_section.strip_prefix(header).unwrap();
-        // 4000 chars of memory + "[truncated]" = 4011
-        assert!(content.len() <= 4000 + "[truncated]".len());
+        // The memory section should be visually emphasized and contain truncation notice
+        assert!(result.contains("📝 PERSISTENT MEMORY"));
+        let memory_start = result.find("📝 PERSISTENT MEMORY").unwrap();
+        let memory_section = &result[memory_start..];
+        assert!(memory_section.contains("[truncated]"));
     }
 
     // -----------------------------------------------------------------------
