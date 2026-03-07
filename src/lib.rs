@@ -9,5 +9,6 @@ pub mod channels;
 pub mod config;
 pub mod context;
 pub mod memory;
+pub mod permissions;
 pub mod session;
 pub mod tools;

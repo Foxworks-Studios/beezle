@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use clap::Parser;
+use tokio::sync::{Mutex, RwLock, broadcast};
 
 use beezle::agent::build_subagent;
 use beezle::bus::{self, Response};
@@ -18,6 +19,9 @@ use beezle::channels::terminal::TerminalChannel;
 use beezle::config::{self, AppConfig, is_config_complete, load_config, run_onboarding};
 use beezle::context;
 use beezle::memory::{MemoryStore, SystemClock};
+use beezle::permissions::PermissionPolicy;
+use beezle::permissions::guard::{PermissionGuard, PermissionPromptRequest};
+use beezle::permissions::hooks::{HookInput, HookManager};
 use beezle::session::SessionManager;
 use beezle::tools::memory::{MemoryReadTool, MemoryWriteTool};
 use yoagent::agent::Agent;
@@ -25,6 +29,9 @@ use yoagent::provider::{AnthropicProvider, ModelConfig, OpenAiCompatProvider};
 use yoagent::skills::SkillSet;
 use yoagent::tools::default_tools;
 use yoagent::*;
+
+/// Type alias for the shared map of pending permission responses.
+type PendingResponses = Arc<Mutex<HashMap<String, beezle::permissions::PermissionResponse>>>;
 
 // ANSI color helpers — gated by `use_color`.
 const RESET: &str = "\x1b[0m";
@@ -208,11 +215,99 @@ fn load_memory_store() -> Option<Arc<MemoryStore>> {
     )))
 }
 
+/// Builds the raw (unwrapped) list of tools: default + subagent + optional memory.
+///
+/// These tools are not yet wrapped in `PermissionGuard`. Use
+/// [`wrap_tools_in_permission_guard`] to wrap them before passing to the agent.
+fn build_raw_tools(
+    config: &AppConfig,
+    model: &str,
+    api_key: &str,
+    memory_store: Option<Arc<MemoryStore>>,
+) -> Vec<Box<dyn AgentTool>> {
+    let subagent = build_subagent(
+        "spawn_agent",
+        "Spawn a sub-agent to handle a focused task independently. \
+         The sub-agent runs with a fresh context and returns only its final result.",
+        "You are a helpful sub-agent. Complete the task you are given \
+         thoroughly and return the result.",
+        config,
+        model,
+        api_key,
+    );
+
+    let mut tools: Vec<Box<dyn AgentTool>> = default_tools();
+    tools.push(Box::new(subagent));
+
+    if let Some(store) = memory_store {
+        tools.push(Box::new(MemoryReadTool::new(Arc::clone(&store))));
+        tools.push(Box::new(MemoryWriteTool::new(store)));
+    }
+
+    tools
+}
+
+/// Wraps all raw tools in [`PermissionGuard`], enforcing the permission policy
+/// and lifecycle hooks on every tool invocation.
+///
+/// # Arguments
+///
+/// * `config` - App config for building sub-agent tool.
+/// * `model` - Model identifier.
+/// * `api_key` - API key.
+/// * `memory_store` - Optional memory store for memory tools.
+/// * `policy` - Shared permission policy.
+/// * `hooks` - Shared hook manager.
+/// * `prompt_tx` - Broadcast sender for permission prompts.
+/// * `pending` - Shared map for pending permission responses.
+/// * `session_id` - Session identifier for hook inputs.
+/// * `cwd` - Current working directory for hook inputs.
+#[allow(clippy::too_many_arguments)]
+fn wrap_tools_in_permission_guard(
+    config: &AppConfig,
+    model: &str,
+    api_key: &str,
+    memory_store: Option<Arc<MemoryStore>>,
+    policy: &Arc<RwLock<PermissionPolicy>>,
+    hooks: &Arc<HookManager>,
+    prompt_tx: &broadcast::Sender<PermissionPromptRequest>,
+    pending: &PendingResponses,
+    session_id: &str,
+    cwd: &str,
+) -> Vec<Box<dyn AgentTool>> {
+    let raw_tools = build_raw_tools(config, model, api_key, memory_store);
+
+    let tool_names: Vec<&str> = raw_tools.iter().map(|t| t.name()).collect();
+    tracing::debug!(
+        tools_count = raw_tools.len(),
+        tool_names = ?tool_names,
+        "wrapping tools in PermissionGuard"
+    );
+
+    raw_tools
+        .into_iter()
+        .map(|tool| -> Box<dyn AgentTool> {
+            Box::new(
+                PermissionGuard::new(
+                    tool,
+                    Arc::clone(policy),
+                    Arc::clone(hooks),
+                    prompt_tx.clone(),
+                    Arc::clone(pending),
+                )
+                .with_session_id(session_id.to_string())
+                .with_cwd(cwd.to_string()),
+            )
+        })
+        .collect()
+}
+
 /// A configured `Agent` ready for prompting.
 ///
-/// Assembles the provider, tools (default + subagent + memory), skills, and
-/// system prompt into a fully wired `Agent`. Tools are passed unwrapped --
-/// all rendering happens in `run_prompt()`'s event-driven loop.
+/// Assembles the provider, permission-wrapped tools, skills, and system prompt
+/// into a fully wired `Agent`. All tools are wrapped in [`PermissionGuard`]
+/// to enforce the permission policy and lifecycle hooks.
+#[allow(clippy::too_many_arguments)]
 fn build_agent(
     config: &AppConfig,
     model: &str,
@@ -220,6 +315,12 @@ fn build_agent(
     skills: SkillSet,
     system_prompt: &str,
     memory_store: Option<Arc<MemoryStore>>,
+    policy: &Arc<RwLock<PermissionPolicy>>,
+    hooks: &Arc<HookManager>,
+    prompt_tx: &broadcast::Sender<PermissionPromptRequest>,
+    pending: &PendingResponses,
+    session_id: &str,
+    cwd: &str,
 ) -> Agent {
     let is_ollama = config.agent.default_provider == "ollama";
 
@@ -235,28 +336,19 @@ fn build_agent(
         Agent::new(AnthropicProvider)
     };
 
-    // Build the sub-agent tool.
-    let subagent = build_subagent(
-        "spawn_agent",
-        "Spawn a sub-agent to handle a focused task independently. \
-         The sub-agent runs with a fresh context and returns only its final result.",
-        "You are a helpful sub-agent. Complete the task you are given \
-         thoroughly and return the result.",
+    let tools = wrap_tools_in_permission_guard(
         config,
         model,
         api_key,
+        memory_store,
+        policy,
+        hooks,
+        prompt_tx,
+        pending,
+        session_id,
+        cwd,
     );
 
-    let mut tools: Vec<Box<dyn AgentTool>> = default_tools();
-    tools.push(Box::new(subagent));
-
-    // Register memory tools when a MemoryStore is available.
-    if let Some(store) = memory_store {
-        tools.push(Box::new(MemoryReadTool::new(Arc::clone(&store))));
-        tools.push(Box::new(MemoryWriteTool::new(store)));
-    }
-
-    // Log the final tool count and names for debugging.
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
     tracing::debug!(tools_count = tools.len(), tool_names = ?tool_names, "registered agent tools");
 
@@ -612,7 +704,9 @@ fn build_effective_system_prompt(base: &str, memory_content: &str) -> String {
         memory_content.to_owned()
     };
 
-    format!("{enhanced_base}\n\n📝 PERSISTENT MEMORY 📝\n\nThis information persists across sessions and informs your understanding:\n\n{truncated}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    format!(
+        "{enhanced_base}\n\n📝 PERSISTENT MEMORY 📝\n\nThis information persists across sessions and informs your understanding:\n\n{truncated}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
 }
 
 /// Formats a human-readable summary of a tool invocation.
@@ -685,6 +779,11 @@ fn handle_slash_command(
     session_mgr: &SessionManager,
     dim: &str,
     reset: &str,
+    policy: &Arc<RwLock<PermissionPolicy>>,
+    hooks: &Arc<HookManager>,
+    prompt_tx: &broadcast::Sender<PermissionPromptRequest>,
+    pending: &PendingResponses,
+    cwd: &str,
 ) -> SlashResult {
     match input {
         "/quit" | "/exit" => SlashResult::Quit,
@@ -739,6 +838,12 @@ fn handle_slash_command(
                     skills.clone(),
                     system_prompt,
                     None,
+                    policy,
+                    hooks,
+                    prompt_tx,
+                    pending,
+                    session_key,
+                    cwd,
                 );
                 format!("{dim}  (switched to {model}, conversation cleared){reset}\n")
             };
@@ -832,6 +937,13 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Load permission policy and hook manager before building the agent.
+    let policy = Arc::new(RwLock::new(PermissionPolicy::load(&cwd)));
+    let hooks = Arc::new(HookManager::load(&cwd));
+    let (prompt_tx, _prompt_rx) = broadcast::channel::<PermissionPromptRequest>(16);
+    let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
+    let cwd_str = cwd.to_string_lossy().to_string();
+
     let mut agent = build_agent(
         &app_config,
         &model,
@@ -839,6 +951,12 @@ async fn main() -> anyhow::Result<()> {
         skills.clone(),
         &system_prompt,
         memory_store,
+        &policy,
+        &hooks,
+        &prompt_tx,
+        &pending,
+        &session_key,
+        &cwd_str,
     );
 
     // Resume a previous session if requested.
@@ -872,12 +990,39 @@ async fn main() -> anyhow::Result<()> {
 
     // Single-shot mode: run one prompt and exit.
     if let Some(ref prompt_text) = cli.prompt {
+        // Fire SessionStart hook.
+        hooks
+            .run(&HookInput::SessionStart {
+                session_id: session_key.clone(),
+                cwd: cwd_str.clone(),
+                source_channel: "terminal".to_string(),
+            })
+            .await;
+
+        // Fire UserPromptSubmit hook before dispatching the prompt.
+        hooks
+            .run(&HookInput::UserPromptSubmit {
+                session_id: session_key.clone(),
+                cwd: cwd_str.clone(),
+                prompt: prompt_text.clone(),
+            })
+            .await;
+
         let usage = run_prompt(&mut agent, prompt_text, use_color, thinking_key).await;
         print_usage(&usage, use_color);
         // Save single-shot session too.
         if let Ok(json) = agent.save_messages() {
             let _ = session_mgr.save(&session_key, &json);
         }
+
+        // Fire SessionEnd hook on clean exit.
+        hooks
+            .run(&HookInput::SessionEnd {
+                session_id: session_key.clone(),
+                cwd: cwd_str.clone(),
+            })
+            .await;
+
         return Ok(());
     }
 
@@ -891,7 +1036,7 @@ async fn main() -> anyhow::Result<()> {
         "{dim}  cwd:   {}{reset}",
         std::env::current_dir()?.display()
     );
-    
+
     // Show tool count to match skills display.
     let tool_count = {
         let base_count = default_tools().len();
@@ -900,9 +1045,20 @@ async fn main() -> anyhow::Result<()> {
     };
     println!("{dim}  tools: {tool_count} loaded{reset}");
 
-    // Create the command bus and spawn the terminal channel.
+    // Fire SessionStart hook before the REPL loop begins.
+    hooks
+        .run(&HookInput::SessionStart {
+            session_id: session_key.clone(),
+            cwd: cwd_str.clone(),
+            source_channel: "terminal".to_string(),
+        })
+        .await;
+
+    // Create the command bus and spawn the terminal channel with permission prompt support.
     let (command_bus, mut bus_rx) = bus::command_bus(16);
-    let terminal_channel = TerminalChannel::new(use_color);
+    let prompt_rx_for_terminal = prompt_tx.subscribe();
+    let terminal_channel = TerminalChannel::new(use_color)
+        .with_permission_prompt(prompt_rx_for_terminal, Arc::clone(&pending));
     tokio::spawn(async move {
         if let Err(e) = terminal_channel.run(command_bus).await {
             tracing::error!("terminal channel error: {e}");
@@ -928,6 +1084,11 @@ async fn main() -> anyhow::Result<()> {
             &session_mgr,
             dim,
             reset,
+            &policy,
+            &hooks,
+            &prompt_tx,
+            &pending,
+            &cwd_str,
         );
 
         match slash_response {
@@ -942,6 +1103,15 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
             SlashResult::NotSlash => {
+                // Fire UserPromptSubmit hook before dispatching to the agent.
+                hooks
+                    .run(&HookInput::UserPromptSubmit {
+                        session_id: session_key.clone(),
+                        cwd: cwd_str.clone(),
+                        prompt: input.clone(),
+                    })
+                    .await;
+
                 // Regular prompt — send to agent, respond via oneshot.
                 let usage = run_prompt(&mut agent, &input, use_color, thinking_key).await;
                 print_usage(&usage, use_color);
@@ -954,6 +1124,14 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    // Fire SessionEnd hook on clean exit.
+    hooks
+        .run(&HookInput::SessionEnd {
+            session_id: session_key.clone(),
+            cwd: cwd_str.clone(),
+        })
+        .await;
 
     // Auto-save session on exit.
     let (dim, reset) = (color(DIM, use_color), color(RESET, use_color));
@@ -1000,10 +1178,21 @@ mod tests {
         agent: &mut Agent,
         session_mgr: &SessionManager,
     ) -> (SlashResult, String, String) {
+        use beezle::permissions::PermissionPolicy;
+        use beezle::permissions::hooks::HookManager;
+        use tokio::sync::{Mutex, RwLock, broadcast};
+
         let config = AppConfig::default();
         let skills = SkillSet::empty();
         let mut model = "mock-model".to_owned();
         let mut session_key = "test-session".to_owned();
+
+        let policy = Arc::new(RwLock::new(PermissionPolicy::load(std::path::Path::new(
+            "/nonexistent",
+        ))));
+        let hooks = Arc::new(HookManager::empty());
+        let (prompt_tx, _) = broadcast::channel(16);
+        let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
 
         let result = handle_slash_command(
             input,
@@ -1017,6 +1206,11 @@ mod tests {
             session_mgr,
             "",
             "",
+            &policy,
+            &hooks,
+            &prompt_tx,
+            &pending,
+            "/tmp",
         );
 
         (result, model, session_key)
@@ -1379,6 +1573,10 @@ mod tests {
 
     #[tokio::test]
     async fn bus_slash_command_returns_response_via_oneshot() {
+        use beezle::permissions::PermissionPolicy;
+        use beezle::permissions::hooks::HookManager;
+        use tokio::sync::{Mutex, RwLock, broadcast};
+
         let tmp = tempfile::tempdir().unwrap();
         let session_mgr = SessionManager::new(tmp.path()).unwrap();
         let mut agent = mock_agent("ok");
@@ -1386,6 +1584,13 @@ mod tests {
         let skills = SkillSet::empty();
         let mut model = "mock".to_owned();
         let mut session_key = "test".to_owned();
+
+        let policy = Arc::new(RwLock::new(PermissionPolicy::load(std::path::Path::new(
+            "/nonexistent",
+        ))));
+        let hooks = Arc::new(HookManager::empty());
+        let (prompt_tx, _) = broadcast::channel(16);
+        let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
 
         // Create bus, send a /clear command, consume it.
         let (bus, mut rx) = beezle::bus::command_bus(1);
@@ -1415,6 +1620,11 @@ mod tests {
             &session_mgr,
             dim,
             reset,
+            &policy,
+            &hooks,
+            &prompt_tx,
+            &pending,
+            "/tmp",
         );
 
         if let SlashResult::Handled(msg) = result {
@@ -1468,34 +1678,47 @@ mod tests {
 
     #[test]
     fn build_agent_logs_tool_count_and_names() {
-        // Test that build_agent logs the expected tool count and names.
-        use beezle::agent::build_subagent;
+        use beezle::permissions::PermissionPolicy;
+        use beezle::permissions::hooks::HookManager;
+        use tokio::sync::{Mutex, RwLock, broadcast};
 
         let config = AppConfig::default();
         let skills = SkillSet::empty();
-        let memory_store = None; // No memory tools for this test.
-        
+        let memory_store = None;
+
+        let policy = Arc::new(RwLock::new(PermissionPolicy::load(std::path::Path::new(
+            "/nonexistent",
+        ))));
+        let hooks = Arc::new(HookManager::empty());
+        let (prompt_tx, _) = broadcast::channel(16);
+        let pending: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
+
         let _agent = build_agent(
             &config,
-            "test-model", 
+            "test-model",
             "test-key",
             skills,
             "test prompt",
             memory_store,
+            &policy,
+            &hooks,
+            &prompt_tx,
+            &pending,
+            "",
+            "",
         );
-        
-        // This test verifies that build_agent doesn't panic and constructs an agent.
-        // The actual logging verification would require capturing tracing output,
-        // which is complex for unit tests. The behavior is tested in integration.
+
+        // This test verifies that build_agent doesn't panic and constructs an agent
+        // with all tools wrapped in PermissionGuard.
     }
 
-    #[test] 
+    #[test]
     fn tool_count_calculation_without_memory() {
         // Test the tool count calculation logic when memory store is None.
         let base_count = default_tools().len(); // Should be 6
         let additional = 1; // Just the subagent tool
         let expected = base_count + additional;
-        
+
         // For beezle, we expect 6 default tools + 1 subagent = 7 total.
         assert_eq!(expected, 7);
     }
@@ -1506,13 +1729,13 @@ mod tests {
         let base_count = default_tools().len(); // Should be 6  
         let additional = 1 + 2; // subagent + 2 memory tools
         let expected = base_count + additional;
-        
+
         // For beezle with memory, we expect 6 default + 1 subagent + 2 memory = 9 total.
         assert_eq!(expected, 9);
     }
 
     // -----------------------------------------------------------------------
-    // build_agent_tools_include_spawn_agent  
+    // build_agent_tools_include_spawn_agent
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1552,9 +1775,9 @@ mod tests {
         // RED: Test that when project context contains MANDATORY rules,
         // they are highlighted prominently in the final system prompt.
         let base_with_project_context = "<project-context>\n# Source: /test/CLAUDE.md\n### Red/Green TDD (MANDATORY)\n**Every change follows strict TDD.**\n</project-context>\n\nYou are a helpful assistant.";
-        
+
         let result = build_effective_system_prompt(base_with_project_context, "");
-        
+
         // The test should pass now because our enhanced function emphasizes mandatory rules
         assert!(
             result.contains("⚠️  MANDATORY PROJECT CONSTRAINTS"),
@@ -1567,9 +1790,9 @@ mod tests {
         // RED: Test that memory content gets clear visual emphasis
         let base_prompt = "You are a helpful assistant.";
         let memory = "User prefers Rust. Project uses TDD.";
-        
+
         let result = build_effective_system_prompt(base_prompt, memory);
-        
+
         // Memory should have visual emphasis similar to project constraints
         assert!(
             result.contains("📝 PERSISTENT MEMORY"),
@@ -1652,6 +1875,94 @@ mod tests {
             label.chars().next().unwrap().is_ascii_uppercase(),
             "thinking label should start with an uppercase letter, got: {label}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Permission wiring tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wrap_tools_in_permission_guard_preserves_tool_names() {
+        use beezle::permissions::PermissionPolicy;
+        use beezle::permissions::guard::PermissionGuard;
+        use beezle::permissions::hooks::HookManager;
+        use tokio::sync::{Mutex, RwLock, broadcast};
+
+        let tools: Vec<Box<dyn AgentTool>> = default_tools();
+        let original_names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+
+        let policy = Arc::new(RwLock::new(PermissionPolicy::load(std::path::Path::new(
+            "/nonexistent",
+        ))));
+        let hooks = Arc::new(HookManager::empty());
+        let (prompt_tx, _prompt_rx) = broadcast::channel(16);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+
+        let wrapped: Vec<Box<dyn AgentTool>> = tools
+            .into_iter()
+            .map(|tool| -> Box<dyn AgentTool> {
+                Box::new(PermissionGuard::new(
+                    tool,
+                    Arc::clone(&policy),
+                    Arc::clone(&hooks),
+                    prompt_tx.clone(),
+                    Arc::clone(&pending),
+                ))
+            })
+            .collect();
+
+        let wrapped_names: Vec<&str> = wrapped.iter().map(|t| t.name()).collect();
+
+        assert_eq!(original_names.len(), wrapped_names.len());
+        for name in &original_names {
+            assert!(
+                wrapped_names.contains(&name.as_str()),
+                "wrapped tools should preserve tool name '{name}'"
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_tools_wraps_all_including_custom() {
+        use beezle::permissions::PermissionPolicy;
+        use beezle::permissions::hooks::HookManager;
+        use tokio::sync::{Mutex, RwLock, broadcast};
+
+        let config = AppConfig::default();
+        let memory_store = None;
+
+        let policy = Arc::new(RwLock::new(PermissionPolicy::load(std::path::Path::new(
+            "/nonexistent",
+        ))));
+        let hooks = Arc::new(HookManager::empty());
+        let (prompt_tx, _prompt_rx) = broadcast::channel(16);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+
+        let wrapped = wrap_tools_in_permission_guard(
+            &config,
+            "test-model",
+            "test-key",
+            memory_store,
+            &policy,
+            &hooks,
+            &prompt_tx,
+            &pending,
+            "",
+            "",
+        );
+
+        let names: Vec<&str> = wrapped.iter().map(|t| t.name()).collect();
+
+        // Should include default_tools + spawn_agent
+        assert!(
+            names.contains(&"spawn_agent"),
+            "wrapped tools should include spawn_agent, got: {names:?}"
+        );
+        assert!(names.contains(&"bash"), "should include bash");
+        assert!(names.contains(&"read_file"), "should include read_file");
+
+        // Total: default_tools (6) + subagent (1) = 7 (no memory tools in this test)
+        assert_eq!(wrapped.len(), 7);
     }
 
     #[tokio::test]
