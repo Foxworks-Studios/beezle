@@ -48,7 +48,7 @@ pub enum PermissionVerdict {
 }
 
 /// The user's response to a permission prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionResponse {
     /// Allow this single invocation.
     Yes,
@@ -56,6 +56,8 @@ pub enum PermissionResponse {
     No,
     /// Allow and remember for the rest of the session.
     Always,
+    /// Allow, remember for the session, and persist the rule to local settings.
+    Persist(String),
 }
 
 /// Errors that can occur in the permissions system.
@@ -234,6 +236,136 @@ impl PermissionPolicy {
             }
         }
     }
+}
+
+/// Whether a tool is eligible for the "persist to local settings" option.
+///
+/// Write tools (`write_file`, `edit_file`) are not eligible — they should
+/// only be approved per-session, never auto-persisted.
+pub fn is_persist_eligible(tool_name: &str) -> bool {
+    !matches!(
+        PermissionPolicy::categorize(tool_name),
+        ToolCategory::Write
+    )
+}
+
+/// Suggest a permission rule pattern for persisting to local settings.
+///
+/// Generates a human-readable `Tool(pattern)` string that would match
+/// similar future invocations of this tool.
+pub fn suggest_persist_pattern(tool_name: &str, args: &serde_json::Value) -> String {
+    let tool_display = capitalize_tool_name(tool_name);
+    match tool_name {
+        "bash" => {
+            let cmd = args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // Use first word (or first two words for common prefixes like "cargo") as prefix
+            let parts: Vec<&str> = cmd.split_whitespace().collect();
+            let prefix = if parts.len() >= 2 && matches!(parts[0], "cargo" | "git" | "npm" | "yarn" | "pnpm" | "bun" | "docker" | "kubectl") {
+                format!("{} {}", parts[0], parts[1])
+            } else if let Some(first) = parts.first() {
+                first.to_string()
+            } else {
+                "*".to_string()
+            };
+            format!("{tool_display}({prefix}:*)")
+        }
+        "read_file" | "write_file" | "edit_file" => {
+            let path = args
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // Use the parent directory with ** glob
+            if let Some(pos) = path.rfind('/') {
+                let dir = &path[..pos];
+                format!("{tool_display}({dir}/**)")
+            } else {
+                format!("{tool_display}(*)")
+            }
+        }
+        "web_fetch" | "web_search" => {
+            let url = args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // Extract domain
+            if let Some(domain) = extract_domain(url) {
+                format!("{tool_display}(domain:{domain})")
+            } else {
+                format!("{tool_display}(*)")
+            }
+        }
+        _ => format!("{tool_display}(*)"),
+    }
+}
+
+/// Persist a permission rule to `.beezle/local.settings.json`.
+///
+/// Reads the existing file (if any), appends the rule to the allow list
+/// (avoiding duplicates), and writes it back.
+pub fn persist_to_local_settings(cwd: &Path, rule: &str) -> Result<(), std::io::Error> {
+    let local_path = cwd.join(".beezle/local.settings.json");
+
+    // Read existing settings or start fresh.
+    let mut settings = if local_path.exists() {
+        let content = std::fs::read_to_string(&local_path)?;
+        serde_json::from_str::<PermissionSettings>(&content).unwrap_or_default()
+    } else {
+        PermissionSettings::default()
+    };
+
+    // Ensure permissions block exists.
+    let perms = settings.permissions.get_or_insert_with(PermissionSettingsInner::default);
+
+    // Don't add duplicates.
+    if !perms.allow.contains(&rule.to_string()) {
+        perms.allow.push(rule.to_string());
+    }
+
+    // Ensure .beezle directory exists.
+    if let Some(parent) = local_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let json = serde_json::to_string_pretty(&settings)
+        .map_err(std::io::Error::other)?;
+    std::fs::write(&local_path, json)?;
+
+    Ok(())
+}
+
+/// Map a tool name to its display name for permission rules.
+///
+/// Tool names like `read_file` map to `Read`, `web_fetch` to `WebFetch`, etc.
+fn capitalize_tool_name(tool_name: &str) -> String {
+    match tool_name {
+        "read_file" | "list_files" | "search" => "Read".to_string(),
+        "write_file" => "Write".to_string(),
+        "edit_file" => "Edit".to_string(),
+        "bash" => "Bash".to_string(),
+        "web_fetch" => "WebFetch".to_string(),
+        "web_search" => "WebSearch".to_string(),
+        "memory_read" => "MemoryRead".to_string(),
+        "memory_write" => "MemoryWrite".to_string(),
+        "spawn_agent" => "SpawnAgent".to_string(),
+        other => {
+            // Fallback: capitalize first letter
+            let mut chars = other.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+            }
+        }
+    }
+}
+
+/// Extract the domain from a URL string.
+fn extract_domain(url: &str) -> Option<&str> {
+    let without_scheme = url.strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    Some(without_scheme.split('/').next().unwrap_or(without_scheme))
 }
 
 /// Extract the primary argument from tool args for pattern matching.
@@ -664,6 +796,117 @@ mod tests {
         };
         let args = serde_json::json!({"file_path": "/src/main.rs"});
         assert_eq!(policy.check("read_file", &args), PermissionVerdict::Allow);
+    }
+
+    // ── suggest_persist_pattern tests ──────────────────────────────
+
+    #[test]
+    fn suggest_pattern_bash_uses_prefix() {
+        let args = serde_json::json!({"command": "cargo clippy -- -D warnings"});
+        let pattern = suggest_persist_pattern("bash", &args);
+        assert_eq!(pattern, "Bash(cargo clippy:*)");
+    }
+
+    #[test]
+    fn suggest_pattern_bash_single_word() {
+        let args = serde_json::json!({"command": "ls"});
+        let pattern = suggest_persist_pattern("bash", &args);
+        assert_eq!(pattern, "Bash(ls:*)");
+    }
+
+    #[test]
+    fn suggest_pattern_read_file() {
+        let args = serde_json::json!({"file_path": "/home/user/project/src/main.rs"});
+        let pattern = suggest_persist_pattern("read_file", &args);
+        assert_eq!(pattern, "Read(/home/user/project/src/**)");
+    }
+
+    #[test]
+    fn suggest_pattern_web_fetch_uses_domain() {
+        let args = serde_json::json!({"url": "https://docs.rs/tokio/latest"});
+        let pattern = suggest_persist_pattern("web_fetch", &args);
+        assert_eq!(pattern, "WebFetch(domain:docs.rs)");
+    }
+
+    #[test]
+    fn suggest_pattern_unknown_tool_uses_wildcard() {
+        let args = serde_json::json!({"foo": "bar"});
+        let pattern = suggest_persist_pattern("some_tool", &args);
+        assert_eq!(pattern, "Some_tool(*)");
+    }
+
+    // ── persist_to_local_settings tests ─────────────────────────────
+
+    #[test]
+    fn persist_adds_rule_to_local_settings() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let beezle_dir = tmp.path().join(".beezle");
+        std::fs::create_dir_all(&beezle_dir).unwrap();
+
+        persist_to_local_settings(tmp.path(), "Bash(cargo test:*)").unwrap();
+
+        let content = std::fs::read_to_string(beezle_dir.join("local.settings.json")).unwrap();
+        let settings: PermissionSettings = serde_json::from_str(&content).unwrap();
+        let perms = settings.permissions.unwrap();
+        assert!(perms.allow.contains(&"Bash(cargo test:*)".to_string()));
+    }
+
+    #[test]
+    fn persist_appends_to_existing_settings() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_settings(
+            tmp.path(),
+            ".beezle/local.settings.json",
+            &["Read(/src/**)"],
+            &["Bash(rm -rf:*)"],
+        );
+
+        persist_to_local_settings(tmp.path(), "Bash(cargo test:*)").unwrap();
+
+        let content =
+            std::fs::read_to_string(tmp.path().join(".beezle/local.settings.json")).unwrap();
+        let settings: PermissionSettings = serde_json::from_str(&content).unwrap();
+        let perms = settings.permissions.unwrap();
+        assert!(perms.allow.contains(&"Read(/src/**)".to_string()));
+        assert!(perms.allow.contains(&"Bash(cargo test:*)".to_string()));
+        assert!(perms.deny.contains(&"Bash(rm -rf:*)".to_string()));
+    }
+
+    #[test]
+    fn persist_does_not_duplicate_existing_rule() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_settings(
+            tmp.path(),
+            ".beezle/local.settings.json",
+            &["Bash(cargo test:*)"],
+            &[],
+        );
+
+        persist_to_local_settings(tmp.path(), "Bash(cargo test:*)").unwrap();
+
+        let content =
+            std::fs::read_to_string(tmp.path().join(".beezle/local.settings.json")).unwrap();
+        let settings: PermissionSettings = serde_json::from_str(&content).unwrap();
+        let perms = settings.permissions.unwrap();
+        assert_eq!(
+            perms.allow.iter().filter(|r| *r == "Bash(cargo test:*)").count(),
+            1
+        );
+    }
+
+    // ── persist_eligible tests ──────────────────────────────────────
+
+    #[test]
+    fn write_tools_not_persist_eligible() {
+        assert!(!is_persist_eligible("write_file"));
+        assert!(!is_persist_eligible("edit_file"));
+    }
+
+    #[test]
+    fn other_tools_are_persist_eligible() {
+        assert!(is_persist_eligible("bash"));
+        assert!(is_persist_eligible("read_file"));
+        assert!(is_persist_eligible("web_fetch"));
     }
 
     #[test]

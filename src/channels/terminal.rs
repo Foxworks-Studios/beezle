@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 
 use crate::bus::{ChannelKind, Command, CommandBus};
 use crate::channels::Channel;
-use crate::permissions::PermissionResponse;
+use crate::permissions::{PermissionResponse, is_persist_eligible, suggest_persist_pattern};
 use crate::permissions::guard::PermissionPromptRequest;
 
 /// Alias for the shared map where permission prompt responses are deposited.
@@ -26,22 +26,60 @@ pub type PendingResponses = Arc<Mutex<HashMap<String, PermissionResponse>>>;
 
 /// Formats a permission prompt for display in the terminal.
 ///
-/// Returns a string in the format `? <tool>: <args>\n  [Y]es  [N]o  [A]lways`.
+/// For persist-eligible tools, shows "Yes, and don't ask again" which persists
+/// to local settings. For write tools, shows "Always (this session)" instead.
 pub fn format_permission_prompt(tool_name: &str, tool_input: &serde_json::Value) -> String {
     let args_display = tool_input.to_string();
-    format!("? {tool_name}: {args_display}\n  [Y]es  [N]o  [A]lways")
+    let header = format!("? {tool_name}: {args_display}");
+
+    if is_persist_eligible(tool_name) {
+        let pattern = suggest_persist_pattern(tool_name, tool_input);
+        format!("{header}\n  1. Yes\n  2. Yes, and don't ask again for: {pattern}\n  3. No")
+    } else {
+        format!("{header}\n  1. Yes\n  2. Always (this session)\n  3. No")
+    }
 }
 
-/// Parses a single line of user input into a [`PermissionResponse`].
+/// Parses user input with context about the tool being prompted.
 ///
-/// Returns `None` if the input is not recognized, signaling that the
-/// prompt should be re-displayed.
+/// For persist-eligible tools: 1=Yes, 2=Persist, 3=No.
+/// For write tools: 1=Yes, 2=Always(session), 3=No.
 pub fn parse_permission_input(input: &str) -> Option<PermissionResponse> {
+    // Legacy letter keys (context-free, used as fallback).
     match input.trim() {
-        "y" | "Y" => Some(PermissionResponse::Yes),
-        "n" | "N" => Some(PermissionResponse::No),
-        "a" | "A" => Some(PermissionResponse::Always),
+        "y" | "Y" | "1" => Some(PermissionResponse::Yes),
+        "n" | "N" | "3" => Some(PermissionResponse::No),
         _ => None,
+    }
+}
+
+/// Parses user input with full context about the tool being prompted.
+///
+/// For persist-eligible tools: 1=Yes, 2=Persist(pattern), 3=No.
+/// For write tools: 1=Yes, 2=Always(session), 3=No.
+pub fn parse_permission_input_for(
+    input: &str,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> Option<PermissionResponse> {
+    let trimmed = input.trim();
+    if is_persist_eligible(tool_name) {
+        match trimmed {
+            "y" | "Y" | "1" => Some(PermissionResponse::Yes),
+            "2" => {
+                let pattern = suggest_persist_pattern(tool_name, tool_input);
+                Some(PermissionResponse::Persist(pattern))
+            }
+            "n" | "N" | "3" => Some(PermissionResponse::No),
+            _ => None,
+        }
+    } else {
+        match trimmed {
+            "y" | "Y" | "1" => Some(PermissionResponse::Yes),
+            "a" | "A" | "2" => Some(PermissionResponse::Always),
+            "n" | "N" | "3" => Some(PermissionResponse::No),
+            _ => None,
+        }
     }
 }
 
@@ -234,7 +272,9 @@ async fn run_permission_prompt_loop(
                 Ok(None) | Err(_) => break,
             };
 
-            if let Some(response) = parse_permission_input(&input) {
+            if let Some(response) =
+                parse_permission_input_for(&input, &request.tool_name, &request.tool_input)
+            {
                 let mut map = pending_responses.lock().await;
                 map.insert(request.id.clone(), response);
                 break;
@@ -286,76 +326,112 @@ mod tests {
     }
 
     #[test]
-    fn format_prompt_contains_response_options() {
-        let prompt = format_permission_prompt("bash", &json!({"command": "ls"}));
-        assert!(prompt.contains("[Y]es"));
-        assert!(prompt.contains("[N]o"));
-        assert!(prompt.contains("[A]lways"));
+    fn format_prompt_persist_eligible_shows_three_options() {
+        let prompt = format_permission_prompt("bash", &json!({"command": "cargo test --release"}));
+        assert!(prompt.contains("1. Yes"));
+        assert!(prompt.contains("2. Yes, and don't ask again for:"));
+        assert!(prompt.contains("cargo test:*"));
+        assert!(prompt.contains("3. No"));
+        assert!(!prompt.contains("session"));
     }
 
     #[test]
-    fn format_prompt_has_correct_layout() {
+    fn format_prompt_write_tool_shows_session_option() {
         let prompt = format_permission_prompt("write_file", &json!({"file_path": "/tmp/test"}));
-        let lines: Vec<&str> = prompt.lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("? write_file: "));
-        assert_eq!(lines[1].trim(), "[Y]es  [N]o  [A]lways");
+        assert!(prompt.contains("1. Yes"));
+        assert!(prompt.contains("2. Always (this session)"));
+        assert!(prompt.contains("3. No"));
+        assert!(!prompt.contains("don't ask again"));
     }
 
-    // ── parse_permission_input tests ─────────────────────────────
+    // ── parse_permission_input_for tests ─────────────────────────
 
     #[test]
-    fn parse_yes_lowercase() {
-        assert_eq!(parse_permission_input("y"), Some(PermissionResponse::Yes));
-    }
-
-    #[test]
-    fn parse_yes_uppercase() {
-        assert_eq!(parse_permission_input("Y"), Some(PermissionResponse::Yes));
-    }
-
-    #[test]
-    fn parse_no_lowercase() {
-        assert_eq!(parse_permission_input("n"), Some(PermissionResponse::No));
-    }
-
-    #[test]
-    fn parse_no_uppercase() {
-        assert_eq!(parse_permission_input("N"), Some(PermissionResponse::No));
-    }
-
-    #[test]
-    fn parse_always_lowercase() {
+    fn parse_persist_eligible_option_1_is_yes() {
+        let args = json!({"command": "ls"});
         assert_eq!(
-            parse_permission_input("a"),
+            parse_permission_input_for("1", "bash", &args),
+            Some(PermissionResponse::Yes)
+        );
+    }
+
+    #[test]
+    fn parse_persist_eligible_option_2_is_persist() {
+        let args = json!({"command": "cargo test --release"});
+        let result = parse_permission_input_for("2", "bash", &args);
+        assert!(matches!(result, Some(PermissionResponse::Persist(_))));
+        if let Some(PermissionResponse::Persist(rule)) = result {
+            assert_eq!(rule, "Bash(cargo test:*)");
+        }
+    }
+
+    #[test]
+    fn parse_persist_eligible_option_3_is_no() {
+        let args = json!({"command": "ls"});
+        assert_eq!(
+            parse_permission_input_for("3", "bash", &args),
+            Some(PermissionResponse::No)
+        );
+    }
+
+    #[test]
+    fn parse_write_tool_option_2_is_always() {
+        let args = json!({"file_path": "/tmp/test"});
+        assert_eq!(
+            parse_permission_input_for("2", "write_file", &args),
             Some(PermissionResponse::Always)
         );
     }
 
     #[test]
-    fn parse_always_uppercase() {
+    fn parse_write_tool_option_3_is_no() {
+        let args = json!({"file_path": "/tmp/test"});
         assert_eq!(
-            parse_permission_input("A"),
+            parse_permission_input_for("3", "write_file", &args),
+            Some(PermissionResponse::No)
+        );
+    }
+
+    #[test]
+    fn parse_letter_keys_still_work() {
+        let args = json!({"command": "ls"});
+        assert_eq!(
+            parse_permission_input_for("y", "bash", &args),
+            Some(PermissionResponse::Yes)
+        );
+        assert_eq!(
+            parse_permission_input_for("n", "bash", &args),
+            Some(PermissionResponse::No)
+        );
+    }
+
+    #[test]
+    fn parse_write_letter_a_is_always() {
+        let args = json!({"file_path": "/tmp/test"});
+        assert_eq!(
+            parse_permission_input_for("a", "write_file", &args),
             Some(PermissionResponse::Always)
         );
     }
 
     #[test]
     fn parse_unrecognized_returns_none() {
-        assert_eq!(parse_permission_input("x"), None);
-        assert_eq!(parse_permission_input("yes"), None);
-        assert_eq!(parse_permission_input(""), None);
-        assert_eq!(parse_permission_input("123"), None);
+        let args = json!({"command": "ls"});
+        assert_eq!(parse_permission_input_for("x", "bash", &args), None);
+        assert_eq!(parse_permission_input_for("yes", "bash", &args), None);
+        assert_eq!(parse_permission_input_for("", "bash", &args), None);
+        assert_eq!(parse_permission_input_for("4", "bash", &args), None);
     }
 
     #[test]
     fn parse_trims_whitespace() {
+        let args = json!({"command": "ls"});
         assert_eq!(
-            parse_permission_input("  y  "),
+            parse_permission_input_for("  1  ", "bash", &args),
             Some(PermissionResponse::Yes)
         );
         assert_eq!(
-            parse_permission_input("\tn\n"),
+            parse_permission_input_for("\tn\n", "bash", &args),
             Some(PermissionResponse::No)
         );
     }

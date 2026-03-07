@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 use yoagent::{AgentTool, ToolContext, ToolError, ToolResult};
 
 use super::hooks::{HookInput, HookManager};
-use super::{PermissionPolicy, PermissionResponse, PermissionVerdict};
+use super::{PermissionPolicy, PermissionResponse, PermissionVerdict, persist_to_local_settings};
 
 /// Counter for generating unique request IDs.
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -196,6 +196,20 @@ impl AgentTool for PermissionGuard {
                     PermissionResponse::Always => {
                         let mut policy = self.policy.write().await;
                         policy.grant_session(&tool_name, &params);
+                    }
+                    PermissionResponse::Persist(ref rule) => {
+                        // Add session grant so we don't prompt again this session.
+                        let mut policy = self.policy.write().await;
+                        policy.grant_session(&tool_name, &params);
+                        // Also add to the in-memory allow list for future checks.
+                        if let Ok(parsed) = super::parse_rule(rule) {
+                            policy.allow.push(parsed);
+                        }
+                        // Persist to local settings file.
+                        let cwd = std::path::Path::new(&self.cwd);
+                        if let Err(e) = persist_to_local_settings(cwd, rule) {
+                            tracing::warn!("failed to persist permission rule: {e}");
+                        }
                     }
                 }
             }
