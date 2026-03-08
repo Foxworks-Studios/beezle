@@ -243,10 +243,7 @@ impl PermissionPolicy {
 /// Write tools (`write_file`, `edit_file`) are not eligible — they should
 /// only be approved per-session, never auto-persisted.
 pub fn is_persist_eligible(tool_name: &str) -> bool {
-    !matches!(
-        PermissionPolicy::categorize(tool_name),
-        ToolCategory::Write
-    )
+    !matches!(PermissionPolicy::categorize(tool_name), ToolCategory::Write)
 }
 
 /// Suggest a permission rule pattern for persisting to local settings.
@@ -257,13 +254,14 @@ pub fn suggest_persist_pattern(tool_name: &str, args: &serde_json::Value) -> Str
     let tool_display = capitalize_tool_name(tool_name);
     match tool_name {
         "bash" => {
-            let cmd = args
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
             // Use first word (or first two words for common prefixes like "cargo") as prefix
             let parts: Vec<&str> = cmd.split_whitespace().collect();
-            let prefix = if parts.len() >= 2 && matches!(parts[0], "cargo" | "git" | "npm" | "yarn" | "pnpm" | "bun" | "docker" | "kubectl") {
+            let prefix = if parts.len() >= 2
+                && matches!(
+                    parts[0],
+                    "cargo" | "git" | "npm" | "yarn" | "pnpm" | "bun" | "docker" | "kubectl"
+                ) {
                 format!("{} {}", parts[0], parts[1])
             } else if let Some(first) = parts.first() {
                 first.to_string()
@@ -273,10 +271,7 @@ pub fn suggest_persist_pattern(tool_name: &str, args: &serde_json::Value) -> Str
             format!("{tool_display}({prefix}:*)")
         }
         "read_file" | "write_file" | "edit_file" => {
-            let path = args
-                .get("file_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
             // Use the parent directory with ** glob
             if let Some(pos) = path.rfind('/') {
                 let dir = &path[..pos];
@@ -286,10 +281,7 @@ pub fn suggest_persist_pattern(tool_name: &str, args: &serde_json::Value) -> Str
             }
         }
         "web_fetch" | "web_search" => {
-            let url = args
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
             // Extract domain
             if let Some(domain) = extract_domain(url) {
                 format!("{tool_display}(domain:{domain})")
@@ -317,7 +309,9 @@ pub fn persist_to_local_settings(cwd: &Path, rule: &str) -> Result<(), std::io::
     };
 
     // Ensure permissions block exists.
-    let perms = settings.permissions.get_or_insert_with(PermissionSettingsInner::default);
+    let perms = settings
+        .permissions
+        .get_or_insert_with(PermissionSettingsInner::default);
 
     // Don't add duplicates.
     if !perms.allow.contains(&rule.to_string()) {
@@ -329,8 +323,7 @@ pub fn persist_to_local_settings(cwd: &Path, rule: &str) -> Result<(), std::io::
         std::fs::create_dir_all(parent)?;
     }
 
-    let json = serde_json::to_string_pretty(&settings)
-        .map_err(std::io::Error::other)?;
+    let json = serde_json::to_string_pretty(&settings).map_err(std::io::Error::other)?;
     std::fs::write(&local_path, json)?;
 
     Ok(())
@@ -363,7 +356,8 @@ fn capitalize_tool_name(tool_name: &str) -> String {
 
 /// Extract the domain from a URL string.
 fn extract_domain(url: &str) -> Option<&str> {
-    let without_scheme = url.strip_prefix("https://")
+    let without_scheme = url
+        .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
     Some(without_scheme.split('/').next().unwrap_or(without_scheme))
 }
@@ -889,7 +883,11 @@ mod tests {
         let settings: PermissionSettings = serde_json::from_str(&content).unwrap();
         let perms = settings.permissions.unwrap();
         assert_eq!(
-            perms.allow.iter().filter(|r| *r == "Bash(cargo test:*)").count(),
+            perms
+                .allow
+                .iter()
+                .filter(|r| *r == "Bash(cargo test:*)")
+                .count(),
             1
         );
     }
@@ -923,10 +921,7 @@ mod tests {
             policy.check("memory_write", &args),
             PermissionVerdict::Allow
         );
-        assert_eq!(
-            policy.check("spawn_agent", &args),
-            PermissionVerdict::Allow
-        );
+        assert_eq!(policy.check("spawn_agent", &args), PermissionVerdict::Allow);
     }
 
     #[test]
@@ -940,10 +935,7 @@ mod tests {
             session_grants: vec![],
         };
         let args = serde_json::json!({"name": "some-agent"});
-        assert_eq!(
-            policy.check("spawn_agent", &args),
-            PermissionVerdict::Deny
-        );
+        assert_eq!(policy.check("spawn_agent", &args), PermissionVerdict::Deny);
     }
 
     #[test]

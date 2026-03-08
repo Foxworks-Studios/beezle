@@ -12,7 +12,10 @@ use std::time::Instant;
 use clap::Parser;
 use tokio::sync::{Mutex, RwLock, broadcast};
 
-use beezle::agent::build_subagent;
+use beezle::agent::sub_agents::{
+    build_sub_agent, builtin_sub_agents, coordinator_agent_prompt, load_model_roster,
+    load_user_sub_agents,
+};
 use beezle::bus::{self, Response};
 use beezle::channels::Channel;
 use beezle::channels::terminal::TerminalChannel;
@@ -25,9 +28,8 @@ use beezle::permissions::hooks::{HookInput, HookManager};
 use beezle::session::SessionManager;
 use beezle::tools::memory::{MemoryReadTool, MemoryWriteTool};
 use yoagent::agent::Agent;
-use yoagent::provider::{AnthropicProvider, ModelConfig, OpenAiCompatProvider};
+use yoagent::provider::{AnthropicProvider, ModelConfig, OpenAiCompatProvider, StreamProvider};
 use yoagent::skills::SkillSet;
-use yoagent::tools::default_tools;
 use yoagent::*;
 
 /// Type alias for the shared map of pending permission responses.
@@ -215,29 +217,16 @@ fn load_memory_store() -> Option<Arc<MemoryStore>> {
     )))
 }
 
-/// Builds the raw (unwrapped) list of tools: default + subagent + optional memory.
+/// Builds the raw (unwrapped) coordinator tool list: only memory tools.
+///
+/// The coordinator delegates file/shell work to sub-agents and only keeps
+/// memory tools directly. Sub-agents are registered separately via
+/// [`Agent::with_sub_agent()`].
 ///
 /// These tools are not yet wrapped in `PermissionGuard`. Use
 /// [`wrap_tools_in_permission_guard`] to wrap them before passing to the agent.
-fn build_raw_tools(
-    config: &AppConfig,
-    model: &str,
-    api_key: &str,
-    memory_store: Option<Arc<MemoryStore>>,
-) -> Vec<Box<dyn AgentTool>> {
-    let subagent = build_subagent(
-        "spawn_agent",
-        "Spawn a sub-agent to handle a focused task independently. \
-         The sub-agent runs with a fresh context and returns only its final result.",
-        "You are a helpful sub-agent. Complete the task you are given \
-         thoroughly and return the result.",
-        config,
-        model,
-        api_key,
-    );
-
-    let mut tools: Vec<Box<dyn AgentTool>> = default_tools();
-    tools.push(Box::new(subagent));
+fn build_raw_tools(memory_store: Option<Arc<MemoryStore>>) -> Vec<Box<dyn AgentTool>> {
+    let mut tools: Vec<Box<dyn AgentTool>> = Vec::new();
 
     if let Some(store) = memory_store {
         tools.push(Box::new(MemoryReadTool::new(Arc::clone(&store))));
@@ -252,9 +241,6 @@ fn build_raw_tools(
 ///
 /// # Arguments
 ///
-/// * `config` - App config for building sub-agent tool.
-/// * `model` - Model identifier.
-/// * `api_key` - API key.
 /// * `memory_store` - Optional memory store for memory tools.
 /// * `policy` - Shared permission policy.
 /// * `hooks` - Shared hook manager.
@@ -262,11 +248,7 @@ fn build_raw_tools(
 /// * `pending` - Shared map for pending permission responses.
 /// * `session_id` - Session identifier for hook inputs.
 /// * `cwd` - Current working directory for hook inputs.
-#[allow(clippy::too_many_arguments)]
 fn wrap_tools_in_permission_guard(
-    config: &AppConfig,
-    model: &str,
-    api_key: &str,
     memory_store: Option<Arc<MemoryStore>>,
     policy: &Arc<RwLock<PermissionPolicy>>,
     hooks: &Arc<HookManager>,
@@ -275,7 +257,7 @@ fn wrap_tools_in_permission_guard(
     session_id: &str,
     cwd: &str,
 ) -> Vec<Box<dyn AgentTool>> {
-    let raw_tools = build_raw_tools(config, model, api_key, memory_store);
+    let raw_tools = build_raw_tools(memory_store);
 
     let tool_names: Vec<&str> = raw_tools.iter().map(|t| t.name()).collect();
     tracing::debug!(
@@ -304,9 +286,10 @@ fn wrap_tools_in_permission_guard(
 
 /// A configured `Agent` ready for prompting.
 ///
-/// Assembles the provider, permission-wrapped tools, skills, and system prompt
-/// into a fully wired `Agent`. All tools are wrapped in [`PermissionGuard`]
-/// to enforce the permission policy and lifecycle hooks.
+/// Assembles the provider, permission-wrapped tools, skills, sub-agents, and
+/// system prompt into a fully wired `Agent`. The coordinator receives only
+/// memory tools directly; file/shell work is delegated to sub-agents
+/// registered via [`Agent::with_sub_agent()`].
 #[allow(clippy::too_many_arguments)]
 fn build_agent(
     config: &AppConfig,
@@ -324,6 +307,12 @@ fn build_agent(
 ) -> Agent {
     let is_ollama = config.agent.default_provider == "ollama";
 
+    let provider: Arc<dyn StreamProvider> = if is_ollama {
+        Arc::new(OpenAiCompatProvider)
+    } else {
+        Arc::new(AnthropicProvider)
+    };
+
     let mut agent = if is_ollama {
         let base_url = config
             .providers
@@ -336,10 +325,8 @@ fn build_agent(
         Agent::new(AnthropicProvider)
     };
 
+    // Build coordinator tools (memory only -- no default_tools).
     let tools = wrap_tools_in_permission_guard(
-        config,
-        model,
-        api_key,
         memory_store,
         policy,
         hooks,
@@ -350,14 +337,42 @@ fn build_agent(
     );
 
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-    tracing::debug!(tools_count = tools.len(), tool_names = ?tool_names, "registered agent tools");
+    tracing::debug!(tools_count = tools.len(), tool_names = ?tool_names, "registered coordinator tools");
+
+    // Load sub-agent definitions and model roster.
+    let mut sub_agent_defs = builtin_sub_agents();
+    // When using a local provider (Ollama), clear hardcoded Anthropic model IDs
+    // so that all sub-agents inherit the parent coordinator's model.
+    if is_ollama {
+        for def in &mut sub_agent_defs {
+            def.model = None;
+        }
+    }
+    let user_agents = load_user_sub_agents();
+    sub_agent_defs.extend(user_agents);
+
+    let model_roster = load_model_roster(config);
+
+    // Log all registered sub-agent names.
+    let sub_agent_names: Vec<&str> = sub_agent_defs.iter().map(|d| d.name.as_str()).collect();
+    tracing::debug!(sub_agents = ?sub_agent_names, "registered sub-agents");
+
+    // Append the coordinator agent prompt section to the system prompt.
+    let agent_prompt_section = coordinator_agent_prompt(&sub_agent_defs, &model_roster);
+    let full_system_prompt = format!("{system_prompt}\n\n{agent_prompt_section}");
 
     agent = agent
-        .with_system_prompt(system_prompt)
+        .with_system_prompt(&full_system_prompt)
         .with_model(model)
         .with_api_key(api_key)
         .with_skills(skills)
         .with_tools(tools);
+
+    // Register each sub-agent with the coordinator.
+    for def in &sub_agent_defs {
+        let sub = build_sub_agent(def, Arc::clone(&provider), model, api_key);
+        agent = agent.with_sub_agent(sub);
+    }
 
     agent
 }
@@ -1037,12 +1052,10 @@ async fn main() -> anyhow::Result<()> {
         std::env::current_dir()?.display()
     );
 
-    // Show tool count to match skills display.
-    let tool_count = {
-        let base_count = default_tools().len();
-        let additional = 1 + if has_memory { 2 } else { 0 }; // subagent + memory tools
-        base_count + additional
-    };
+    // Show tool count: memory tools + sub-agents (builtin + user-defined).
+    let memory_tool_count = if has_memory { 2 } else { 0 };
+    let sub_agent_count = builtin_sub_agents().len() + load_user_sub_agents().len();
+    let tool_count = memory_tool_count + sub_agent_count;
     println!("{dim}  tools: {tool_count} loaded{reset}");
 
     // Fire SessionStart hook before the REPL loop begins.
@@ -1713,57 +1726,45 @@ mod tests {
     }
 
     #[test]
-    fn tool_count_calculation_without_memory() {
-        // Test the tool count calculation logic when memory store is None.
-        let base_count = default_tools().len(); // Should be 6
-        let additional = 1; // Just the subagent tool
-        let expected = base_count + additional;
-
-        // For beezle, we expect 6 default tools + 1 subagent = 7 total.
-        assert_eq!(expected, 7);
-    }
-
-    #[test]
-    fn tool_count_calculation_with_memory() {
-        // Test the tool count calculation logic when memory store is available.
-        let base_count = default_tools().len(); // Should be 6  
-        let additional = 1 + 2; // subagent + 2 memory tools
-        let expected = base_count + additional;
-
-        // For beezle with memory, we expect 6 default + 1 subagent + 2 memory = 9 total.
-        assert_eq!(expected, 9);
+    fn tool_count_uses_dynamic_sub_agent_count() {
+        // builtin_sub_agents() returns 3 by default; count should be dynamic.
+        use beezle::agent::sub_agents::builtin_sub_agents;
+        let builtin_count = builtin_sub_agents().len();
+        assert_eq!(builtin_count, 3);
+        // With memory: 2 memory tools + builtin sub-agents.
+        let memory_tool_count = 2;
+        assert_eq!(memory_tool_count + builtin_count, 5);
+        // Without memory: 0 + builtin sub-agents.
+        assert_eq!(0 + builtin_count, 3);
     }
 
     // -----------------------------------------------------------------------
-    // build_agent_tools_include_spawn_agent
+    // build_raw_tools returns only memory tools
     // -----------------------------------------------------------------------
 
     #[test]
-    fn build_agent_tools_include_spawn_agent() {
-        // Verify that default_tools() plus the unwrapped subagent tool
-        // yields a list containing "spawn_agent".
-        use beezle::agent::build_subagent;
-
-        let config = AppConfig::default();
-        let subagent = build_subagent(
-            "spawn_agent",
-            "Spawn a sub-agent to handle a focused task independently.",
-            "You are a helpful sub-agent. Complete the task thoroughly and return the result.",
-            &config,
-            "claude-sonnet-4-20250514",
-            "test-key",
-        );
-
-        let mut tools: Vec<Box<dyn AgentTool>> = default_tools();
-        tools.push(Box::new(subagent));
-
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+    fn build_raw_tools_without_memory_returns_empty() {
+        let tools = build_raw_tools(None);
         assert!(
-            names.contains(&"spawn_agent"),
-            "tools should contain spawn_agent, got: {names:?}"
+            tools.is_empty(),
+            "coordinator should have no tools when memory is absent"
         );
-        // spawn_agent should be in addition to default tools.
-        assert!(tools.len() > default_tools().len());
+    }
+
+    #[test]
+    fn build_raw_tools_with_memory_returns_two_tools() {
+        use beezle::memory::{MemoryStore, SystemClock};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(MemoryStore::new(
+            dir.path().to_path_buf(),
+            Arc::new(SystemClock),
+        ));
+        let tools = build_raw_tools(Some(store));
+        assert_eq!(tools.len(), 2);
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"memory_read"));
+        assert!(names.contains(&"memory_write"));
     }
 
     // -----------------------------------------------------------------------
@@ -1887,6 +1888,7 @@ mod tests {
         use beezle::permissions::guard::PermissionGuard;
         use beezle::permissions::hooks::HookManager;
         use tokio::sync::{Mutex, RwLock, broadcast};
+        use yoagent::tools::default_tools;
 
         let tools: Vec<Box<dyn AgentTool>> = default_tools();
         let original_names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
@@ -1923,12 +1925,11 @@ mod tests {
     }
 
     #[test]
-    fn wrap_tools_wraps_all_including_custom() {
+    fn wrap_tools_returns_empty_without_memory() {
         use beezle::permissions::PermissionPolicy;
         use beezle::permissions::hooks::HookManager;
         use tokio::sync::{Mutex, RwLock, broadcast};
 
-        let config = AppConfig::default();
         let memory_store = None;
 
         let policy = Arc::new(RwLock::new(PermissionPolicy::load(std::path::Path::new(
@@ -1939,9 +1940,6 @@ mod tests {
         let pending = Arc::new(Mutex::new(HashMap::new()));
 
         let wrapped = wrap_tools_in_permission_guard(
-            &config,
-            "test-model",
-            "test-key",
             memory_store,
             &policy,
             &hooks,
@@ -1951,18 +1949,12 @@ mod tests {
             "",
         );
 
-        let names: Vec<&str> = wrapped.iter().map(|t| t.name()).collect();
-
-        // Should include default_tools + spawn_agent
+        // Coordinator has no tools when memory is absent (sub-agents are separate).
         assert!(
-            names.contains(&"spawn_agent"),
-            "wrapped tools should include spawn_agent, got: {names:?}"
+            wrapped.is_empty(),
+            "coordinator should have no tools without memory, got: {:?}",
+            wrapped.iter().map(|t| t.name()).collect::<Vec<_>>()
         );
-        assert!(names.contains(&"bash"), "should include bash");
-        assert!(names.contains(&"read_file"), "should include read_file");
-
-        // Total: default_tools (6) + subagent (1) = 7 (no memory tools in this test)
-        assert_eq!(wrapped.len(), 7);
     }
 
     #[tokio::test]

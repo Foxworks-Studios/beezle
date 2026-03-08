@@ -18,8 +18,8 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 
 use crate::bus::{ChannelKind, Command, CommandBus};
 use crate::channels::Channel;
-use crate::permissions::{PermissionResponse, is_persist_eligible, suggest_persist_pattern};
 use crate::permissions::guard::PermissionPromptRequest;
+use crate::permissions::{PermissionResponse, is_persist_eligible, suggest_persist_pattern};
 
 /// Alias for the shared map where permission prompt responses are deposited.
 pub type PendingResponses = Arc<Mutex<HashMap<String, PermissionResponse>>>;

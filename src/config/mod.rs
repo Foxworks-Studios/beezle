@@ -12,6 +12,24 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// A configured model available for agent use.
+///
+/// Each entry describes a model that can be selected by the coordinator
+/// or assigned to a sub-agent. Sourced from `[[models]]` entries in the
+/// TOML config.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ModelEntry {
+    /// Model identifier (e.g. `"claude-opus-4-20250514"`).
+    #[serde(default)]
+    pub id: String,
+    /// Provider name (e.g. `"anthropic"`, `"ollama"`).
+    #[serde(default)]
+    pub provider: String,
+    /// Human-readable guidance on when to use this model.
+    #[serde(default)]
+    pub guidance: String,
+}
+
 /// Top-level application configuration, serialized as TOML.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppConfig {
@@ -21,6 +39,9 @@ pub struct AppConfig {
     pub providers: ProvidersConfig,
     /// Shell execution safety rules.
     pub shell: ShellConfig,
+    /// Available models for agent assignment.
+    #[serde(default)]
+    pub models: Vec<ModelEntry>,
 }
 
 /// Agent identity and behavioral limits.
@@ -189,6 +210,7 @@ impl Default for AppConfig {
                 ollama: None,
             },
             shell: ShellConfig::default(),
+            models: Vec::new(),
         }
     }
 }
@@ -433,6 +455,51 @@ blocked_commands = []
         assert_eq!(config.agent.name, "minimal");
         assert_eq!(config.agent.max_iterations, 5);
         assert!(config.providers.anthropic.is_none());
+    }
+
+    #[test]
+    fn toml_with_models_entry_deserializes_correctly() {
+        let toml_str = r#"
+[agent]
+name = "test"
+max_iterations = 10
+
+[providers]
+
+[shell]
+allowed_dirs = []
+blocked_commands = []
+
+[[models]]
+id = "claude-opus-4-20250514"
+provider = "anthropic"
+guidance = "Use for complex coding tasks requiring deep reasoning"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.models.len(), 1);
+        assert_eq!(config.models[0].id, "claude-opus-4-20250514");
+        assert_eq!(config.models[0].provider, "anthropic");
+        assert_eq!(
+            config.models[0].guidance,
+            "Use for complex coding tasks requiring deep reasoning"
+        );
+    }
+
+    #[test]
+    fn toml_without_models_section_yields_empty_vec() {
+        let toml_str = r#"
+[agent]
+name = "minimal"
+max_iterations = 5
+
+[providers]
+
+[shell]
+allowed_dirs = []
+blocked_commands = []
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.models.is_empty());
     }
 
     #[test]
