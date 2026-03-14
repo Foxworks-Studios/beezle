@@ -485,7 +485,9 @@ such as Penetrating.";
         .with_api_key(api_key)
         .with_system_prompt(system);
 
-    let mut rx = agent.prompt(user_prompt).await;
+    // Caller owns the channel — prompt_with_sender runs the loop and drops tx on return.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    agent.prompt_with_sender(user_prompt, tx).await;
     let mut result = String::new();
 
     while let Some(event) = rx.recv().await {
@@ -498,18 +500,17 @@ such as Penetrating.";
         }
     }
 
-    agent.finish().await;
-
     let label = result.trim().to_owned();
     if label.is_empty() { None } else { Some(label) }
 }
 
 /// Runs a prompt through the agent using an event-driven loop.
 ///
-/// Spawns the agent loop on a background task via `agent.prompt()`, then
-/// processes streamed `AgentEvent`s in real time. Shows a thinking indicator
-/// while waiting for the first event. Supports Ctrl+C cancellation via
-/// `agent.abort()`. After the loop, `agent.finish()` restores agent state.
+/// Creates a caller-owned channel, spawns the event consumer/renderer as a
+/// background task, then runs `prompt_with_sender` on the calling task with
+/// `tokio::select!` for Ctrl+C cancellation. The consumer task renders
+/// streamed events in real time and returns `(last_usage, streaming_text)`
+/// via its `JoinHandle`.
 ///
 /// # Arguments
 ///
@@ -528,18 +529,23 @@ async fn run_prompt(
     use_color: bool,
     thinking_api_key: Option<&str>,
 ) -> Usage {
-    // Spawn the Haiku label call and agent prompt concurrently.
-    // The agent loop runs on a background task, so events buffer in the channel
-    // while we wait for the thinking label.
+    // Spawn the Haiku label call concurrently before the agent loop starts.
     let label_fut = thinking_api_key.map(|key| {
         let key = key.to_owned();
         let msg = prompt.to_owned();
         tokio::spawn(async move { fetch_thinking_label(&key, &msg).await })
     });
-    let mut rx = agent.prompt(prompt).await;
-    let mut last_usage = Usage::default();
-    let mut tool_starts: HashMap<String, Instant> = HashMap::new();
-    let mut streaming_text = false;
+
+    // Resolve the thinking label before spawning the consumer so the label
+    // string can be moved into the consumer task.
+    let current_label = match label_fut {
+        Some(handle) => handle
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| thinking_label().to_owned()),
+        None => thinking_label().to_owned(),
+    };
 
     let (yellow, green, red, dim, reset) = (
         color(YELLOW, use_color),
@@ -549,122 +555,142 @@ async fn run_prompt(
         color(RESET, use_color),
     );
 
-    // Await the Haiku label; fall back to a random static label on failure.
-    let current_label = match label_fut {
-        Some(handle) => handle
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| thinking_label().to_owned()),
-        None => thinking_label().to_owned(),
-    };
+    // Caller owns the channel — prompt_with_sender moves tx and drops it on return.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+
     print_status_line(&current_label, yellow, dim, reset);
 
-    loop {
-        tokio::select! {
-            event = rx.recv() => {
-                let Some(event) = event else { break };
+    // Spawn the consumer task BEFORE calling prompt_with_sender so events
+    // are consumed in real time while the agent loop drives tx.
+    let consumer = tokio::spawn(async move {
+        let mut last_usage = Usage::default();
+        let mut tool_starts: HashMap<String, Instant> = HashMap::new();
+        let mut streaming_text = false;
 
-                match event {
-                    AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args, .. } => {
-                        clear_status_line();
-                        if streaming_text {
-                            println!();
-                            streaming_text = false;
-                        }
-                        tool_starts.insert(tool_call_id.clone(), Instant::now());
-                        let summary = format_tool_summary(&tool_name, &args);
-                        // Print tool line without newline; ToolExecutionEnd appends result.
-                        print!("{yellow}  > {summary}{reset}");
-                        io::stdout().flush().ok();
+        while let Some(event) = rx.recv().await {
+            match event {
+                AgentEvent::ToolExecutionStart {
+                    tool_call_id,
+                    tool_name,
+                    args,
+                    ..
+                } => {
+                    clear_status_line();
+                    if streaming_text {
+                        println!();
+                        streaming_text = false;
                     }
-                    AgentEvent::ToolExecutionEnd { tool_call_id, is_error, .. } => {
-                        let elapsed = tool_starts.remove(&tool_call_id)
-                            .map(|t| t.elapsed());
-                        let duration = elapsed
-                            .map(|d| format!(" ({:.1}s)", d.as_secs_f64()))
-                            .unwrap_or_default();
-                        if is_error {
-                            println!(" {red}x{duration}{reset}");
-                        } else {
-                            println!(" {green}ok{duration}{reset}");
-                        }
-                        print_status_line(&current_label, yellow, dim, reset);
-                    }
-                    AgentEvent::MessageUpdate { delta: StreamDelta::Text { delta }, .. } => {
-                        // During text streaming, hide the status line.
-                        if !streaming_text {
-                            clear_status_line();
-                            streaming_text = true;
-                        }
-                        print!("{delta}");
-                        io::stdout().flush().ok();
-                    }
-                    AgentEvent::MessageUpdate { delta: StreamDelta::Thinking { delta }, .. } => {
-                        if !streaming_text {
-                            clear_status_line();
-                            streaming_text = true;
-                        }
-                        print!("{dim}{delta}{reset}");
-                        io::stdout().flush().ok();
-                    }
-                    AgentEvent::MessageEnd { message: AgentMessage::Llm(Message::Assistant {
-                        stop_reason: StopReason::Error, error_message, ..
-                    }) } => {
-                        clear_status_line();
-                        if streaming_text {
-                            println!();
-                            streaming_text = false;
-                        }
-                        let msg = error_message.as_deref().unwrap_or("unknown error");
-                        tracing::error!("{msg}");
-                        println!("{red}  error: {msg}{reset}");
-                        print_status_line(&current_label, yellow, dim, reset);
-                    }
-                    AgentEvent::MessageEnd { .. } => {
-                        // Non-error message end: text streaming done, re-show status.
-                        if streaming_text {
-                            println!();
-                            streaming_text = false;
-                        }
-                        clear_status_line();
-                        print_status_line(&current_label, yellow, dim, reset);
-                    }
-                    AgentEvent::AgentEnd { messages } => {
-                        for msg in messages.iter().rev() {
-                            if let AgentMessage::Llm(Message::Assistant { usage, .. }) = msg {
-                                last_usage = usage.clone();
-                                break;
-                            }
-                        }
-                    }
-                    AgentEvent::ProgressMessage { text, .. } => {
-                        clear_status_line();
-                        println!("{dim}  {text}{reset}");
-                        print_status_line(&current_label, yellow, dim, reset);
-                    }
-                    AgentEvent::InputRejected { reason } => {
-                        clear_status_line();
-                        println!("{red}  rejected: {reason}{reset}");
-                        print_status_line(&current_label, yellow, dim, reset);
-                    }
-                    _ => {}
+                    tool_starts.insert(tool_call_id.clone(), Instant::now());
+                    let summary = format_tool_summary(&tool_name, &args);
+                    print!("{yellow}  > {summary}{reset}");
+                    io::stdout().flush().ok();
                 }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                agent.abort();
-                break;
+                AgentEvent::ToolExecutionEnd {
+                    tool_call_id,
+                    is_error,
+                    ..
+                } => {
+                    let elapsed = tool_starts.remove(&tool_call_id).map(|t| t.elapsed());
+                    let duration = elapsed
+                        .map(|d| format!(" ({:.1}s)", d.as_secs_f64()))
+                        .unwrap_or_default();
+                    if is_error {
+                        println!(" {red}x{duration}{reset}");
+                    } else {
+                        println!(" {green}ok{duration}{reset}");
+                    }
+                    print_status_line(&current_label, yellow, dim, reset);
+                }
+                AgentEvent::MessageUpdate {
+                    delta: StreamDelta::Text { delta },
+                    ..
+                } => {
+                    if !streaming_text {
+                        clear_status_line();
+                        streaming_text = true;
+                    }
+                    print!("{delta}");
+                    io::stdout().flush().ok();
+                }
+                AgentEvent::MessageUpdate {
+                    delta: StreamDelta::Thinking { delta },
+                    ..
+                } => {
+                    if !streaming_text {
+                        clear_status_line();
+                        streaming_text = true;
+                    }
+                    print!("{dim}{delta}{reset}");
+                    io::stdout().flush().ok();
+                }
+                AgentEvent::MessageEnd {
+                    message:
+                        AgentMessage::Llm(Message::Assistant {
+                            stop_reason: StopReason::Error,
+                            error_message,
+                            ..
+                        }),
+                } => {
+                    clear_status_line();
+                    if streaming_text {
+                        println!();
+                        streaming_text = false;
+                    }
+                    let msg = error_message.as_deref().unwrap_or("unknown error");
+                    tracing::error!("{msg}");
+                    println!("{red}  error: {msg}{reset}");
+                    print_status_line(&current_label, yellow, dim, reset);
+                }
+                AgentEvent::MessageEnd { .. } => {
+                    if streaming_text {
+                        println!();
+                        streaming_text = false;
+                    }
+                    clear_status_line();
+                    print_status_line(&current_label, yellow, dim, reset);
+                }
+                AgentEvent::AgentEnd { messages } => {
+                    for msg in messages.iter().rev() {
+                        if let AgentMessage::Llm(Message::Assistant { usage, .. }) = msg {
+                            last_usage = usage.clone();
+                            break;
+                        }
+                    }
+                }
+                AgentEvent::ProgressMessage { text, .. } => {
+                    clear_status_line();
+                    println!("{dim}  {text}{reset}");
+                    print_status_line(&current_label, yellow, dim, reset);
+                }
+                AgentEvent::InputRejected { reason } => {
+                    clear_status_line();
+                    println!("{red}  rejected: {reason}{reset}");
+                    print_status_line(&current_label, yellow, dim, reset);
+                }
+                _ => {}
             }
         }
+
+        (last_usage, streaming_text)
+    });
+
+    // Run the agent loop on the calling task. Ctrl+C triggers abort() here
+    // because &mut Agent is not Send and must stay on this task.
+    tokio::select! {
+        _ = agent.prompt_with_sender(prompt, tx) => {}
+        _ = tokio::signal::ctrl_c() => {
+            agent.abort();
+        }
     }
+
+    // Join the consumer to retrieve usage and streaming state.
+    let (last_usage, streaming_text) = consumer.await.expect("consumer task panicked");
 
     // Clean up the persistent status line.
     clear_status_line();
     if streaming_text {
         println!();
     }
-
-    agent.finish().await;
 
     last_usage
 }
@@ -1980,5 +2006,27 @@ mod tests {
 
         // Should process tool execution events and return without panicking.
         let _usage = run_prompt(&mut agent, "run a command", false, None).await;
+    }
+
+    #[tokio::test]
+    async fn prompt_with_sender_channel_owned_by_caller() {
+        use tokio::sync::mpsc;
+
+        let mut agent = mock_agent("response");
+
+        // Caller creates the channel — not returned by the agent.
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+        // prompt_with_sender runs the full agent loop and drops tx on return.
+        agent.prompt_with_sender("hi", tx).await;
+
+        // Drain all events from the caller-owned rx.
+        while let Some(_event) = rx.recv().await {}
+
+        // Channel is closed (sender dropped by prompt_with_sender on return).
+        assert!(rx.recv().await.is_none(), "channel should be closed");
+
+        // Agent accumulated user + assistant messages.
+        assert_eq!(agent.messages().len(), 2);
     }
 }
